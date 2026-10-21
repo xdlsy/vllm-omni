@@ -72,6 +72,12 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     decode_input_reference,
 )
 from vllm_omni.errors import OmniClientError
+from vllm_omni.profiler.h3_p0 import (
+    call as _h3_call,
+)
+from vllm_omni.profiler.h3_p0 import (
+    profile as _h3_profile,
+)
 
 logger = init_logger(__name__)
 
@@ -724,6 +730,7 @@ def _minimax_h3_upload_limit(upload: UploadFile) -> int:
     return MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES
 
 
+@_h3_profile("api/ref_read")
 async def _read_upload_limited(upload: UploadFile, *, max_bytes: int | None = None) -> bytes:
     """Read an upload with an optional hard byte limit."""
     if max_bytes is None:
@@ -752,6 +759,7 @@ async def _read_upload_limited(upload: UploadFile, *, max_bytes: int | None = No
     return b"".join(chunks)
 
 
+@_h3_profile("api/ref_validate")
 def _validate_minimax_h3_image_payload(
     payload: bytes,
     *,
@@ -812,7 +820,9 @@ async def _persist_uploaded_media_references(
                 try:
                     _validate_minimax_h3_image_payload(payload, filename=upload.filename)
                     images.append(
-                        _decode_image_bytes(
+                        _h3_call(
+                            "api/ref_decode",
+                            _decode_image_bytes,
                             payload,
                             source=f"uploaded image reference: {upload.filename}",
                         )
@@ -849,6 +859,7 @@ async def _persist_uploaded_media_references(
     return images, videos, audios
 
 
+@_h3_profile("api/parse_refs")
 async def _parse_video_form(
     raw_request: Request,
     prompt: str = Form(...),

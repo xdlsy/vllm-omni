@@ -209,6 +209,9 @@ from vllm_omni.entrypoints.serve.utils.routes import (
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.profiler.h3_p0 import (
+    request as _h3_request,
+)
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -410,7 +413,11 @@ async def omni_run_server_worker(
                     scope.setdefault("state", {})
                     scope["state"]["request_timestamp"] = time.time()
 
-                await self._inner(scope, receive, send)
+                if scope["type"] == "http" and scope.get("path", "").startswith("/v1/videos"):
+                    with _h3_request(api_path=scope["path"]):
+                        await self._inner(scope, receive, send)
+                else:
+                    await self._inner(scope, receive, send)
 
         # Startup duplex warmup: real /v1/realtime connections wait on this
         # event. Video-required models (AURA) do this by default — one short

@@ -13,12 +13,20 @@ from collections.abc import Sequence
 
 import torch
 
+from vllm_omni.profiler.h3_p0 import (
+    call as _h3_call,
+)
+from vllm_omni.profiler.h3_p0 import (
+    profile as _h3_profile,
+)
+
 from .packed_tokens import minimax_h3_patchify_video_latent
 
 # Channel-major packed audio rows always carry a stereo layout.
 MINIMAX_H3_AUDIO_COND_CHANNELS = 2
 
 
+@_h3_profile("noise/condition_aug")
 def minimax_h3_imgvid_cond_noise_aug_rows(
     clean_rows: torch.Tensor,
     *,
@@ -88,7 +96,9 @@ def minimax_h3_imgvid_cond_noise_aug_rows(
         # the target clip and consequently rejected valid long references.
         full_t = max(target_latent_t + imgvid_cond_num_frames, latent_t)
         generator = torch.Generator(device="cpu").manual_seed(int(seed))
-        noise = torch.randn(
+        noise = _h3_call(
+            "noise/condition_randn",
+            torch.randn,
             1,
             24,
             full_t,
@@ -151,7 +161,9 @@ def minimax_h3_audio_cond_noise_aug_rows(
         row_count = audio_channels * audio_t
         clean_part = clean_rows[row_offset : row_offset + row_count].detach().to(device="cpu", dtype=torch.float32)
         generator = torch.Generator(device="cpu").manual_seed(int(seed) + 1)
-        noise = torch.randn(
+        noise = _h3_call(
+            "noise/condition_randn",
+            torch.randn,
             clean_part.shape,
             generator=generator,
             dtype=torch.float32,

@@ -24,6 +24,9 @@ import torch
 from PIL import Image
 
 from vllm_omni.errors import OmniClientError
+from vllm_omni.profiler.h3_p0 import (
+    profile as _h3_profile,
+)
 
 VISION_START = "<|vision_start|>"
 VISION_END = "<|vision_end|>"
@@ -78,6 +81,7 @@ def minimax_h3_fps_unlocked() -> bool:
     return _unlock_enabled(MINIMAX_H3_UNLOCK_FPS_ENV)
 
 
+@_h3_profile("prepare/image_load_rgb")
 def load_minimax_h3_images(value: Any) -> list[Image.Image]:
     """Normalize one or more H3 image inputs to RGB PIL images."""
     if isinstance(value, (list, tuple)):
