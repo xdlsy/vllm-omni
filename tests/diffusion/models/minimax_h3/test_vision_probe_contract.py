@@ -8,7 +8,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -20,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[4]
 
 def load_file(name, path):
     spec = importlib.util.spec_from_file_location(name, ROOT / path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -27,6 +29,9 @@ def load_file(name, path):
 
 
 class VisionContractTests(unittest.TestCase):
+    parallel: ModuleType
+    probe: ModuleType
+
     @classmethod
     def setUpClass(cls):
         cls.parallel = load_file(
@@ -71,9 +76,79 @@ class VisionContractTests(unittest.TestCase):
     def test_empty_plan(self):
         self.assertEqual(self.parallel.build_vision_plan((), 16).rank_token_indices, ((),) * 16)
 
+    def test_short_sdpa_head_guard_preserves_head_order_and_long_path(self):
+        with patch.dict(sys.modules, {"vision_encoding_probe": self.probe}):
+            runner = load_file("vision_ulysses_guard_test", "benchmarks/minimax_h3/vision_ulysses_probe.py")
+        for heads in (1, 2, 4, 8):
+            q = torch.randn(1, heads, 7, 8)
+            expected = torch.nn.functional.scaled_dot_product_attention(q, q, q)
+            actual = runner.segment_attention(q, q, q, short_min_heads=8)
+            torch.testing.assert_close(actual, expected)
+        q = torch.ones(1, 2, 1025, 8)
+        with patch.object(runner.F, "scaled_dot_product_attention", return_value=q) as call:
+            self.assertIs(runner.segment_attention(q, q, q, short_min_heads=8), q)
+            self.assertIs(call.call_args.args[0], q)
+
+    def test_padded_transport_roundtrip_excludes_padding(self):
+        for size in (1, 2, 4, 8, 16):
+            plan = self.parallel.build_vision_plan((4, 0, 20, 64, 12, 8), size)
+            x = torch.arange(108 * 16 * 2).reshape(108, 16, 2)
+            capacity = max(map(len, plan.rank_token_indices))
+            outgoing = [self.parallel.pack_heads(x[list(ids)], size, capacity) for ids in plan.rank_token_indices]
+            full_heads = [
+                self.parallel.unpack_tokens(torch.stack([part[rank] for part in outgoing]), plan)
+                for rank in range(size)
+            ]
+            for rank, full in enumerate(full_heads):
+                self.assertTrue(torch.equal(full, x[:, rank * (16 // size) : (rank + 1) * (16 // size)]))
+            inverse = [self.parallel.pack_tokens(full, plan) for full in full_heads]
+            for rank, ids in enumerate(plan.rank_token_indices):
+                received = torch.stack([part[rank] for part in inverse])
+                local = self.parallel.unpack_heads(received, len(ids))
+                self.assertTrue(torch.equal(local, x[list(ids)]))
+
     def test_actual_import_must_match_checkout(self):
         with self.assertRaisesRegex(ValueError, "source"):
             self.probe.verify_module_source(SimpleNamespace(__file__=__file__), "encoder.py")
+
+    def test_local_shard_check_stops_on_inequality(self):
+        with patch.dict(sys.modules, {"vision_encoding_probe": self.probe}):
+            runner = load_file("vision_ulysses_probe_test", "benchmarks/minimax_h3/vision_ulysses_probe.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "reference"
+            full = torch.arange(24).reshape(8, 3)
+            writer = self.probe.TensorCheckpoints(directory, reference=True)
+            writer.record("point", full)
+            writer.finish()
+            check = runner.ShardChecks(directory, "cpu")
+            with patch.object(runner.dist, "all_reduce"):
+                check.check("point", full[[1, 3]], (1, 3))
+                self.assertTrue(check.results["point"]["passed"])
+                unequal = runner.ShardChecks(directory, "cpu")
+                with self.assertRaisesRegex(RuntimeError, "point"):
+                    unequal.check("point", full[[1, 3]] + 1, (1, 3))
+                self.assertFalse(unequal.results["point"]["torch_equal"])
+                self.assertEqual(unequal.results["point"]["first_mismatch"], [0, 0])
+                self.assertNotIn("error", unequal.results["point"])
+
+    def test_shard_gate_requires_all_points_and_rejects_duplicates(self):
+        with patch.dict(sys.modules, {"vision_encoding_probe": self.probe}):
+            runner = load_file("vision_ulysses_complete_test", "benchmarks/minimax_h3/vision_ulysses_probe.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "reference"
+            writer = self.probe.TensorCheckpoints(directory, reference=True)
+            writer.record("a", torch.ones(2))
+            writer.record("b", torch.ones(2))
+            writer.finish()
+            check = runner.ShardChecks(directory, "cpu")
+            with patch.object(runner.dist, "all_reduce"):
+                check.check("a", torch.ones(2), (0, 1))
+                with self.assertRaisesRegex(RuntimeError, "missing"):
+                    check.finish()
+                check.check("b", torch.ones(2), (0, 1))
+                check.finish()
+                with self.assertRaisesRegex(RuntimeError, "a"):
+                    check.check("a", torch.ones(2), (0, 1))
 
     def test_case_must_be_covered_by_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:

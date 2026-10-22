@@ -1,8 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU layout contracts for a future H3 vision stage; no runtime collectives."""
+"""Layout and transport primitives for the isolated H3 vision prototype.
+
+Not connected to serving. Padding is removed before attention, never masked
+into the model's sequence. Equal-sized A2A avoids variable-split HCCL calls.
+"""
 
 from dataclasses import dataclass
+
+import torch
+import torch.distributed as dist
 
 
 @dataclass(frozen=True)
@@ -53,3 +60,63 @@ def validate_stage_layout(world_size, vision_ranks, downstream_ranks, sp_size, n
         raise ValueError("the frozen downstream stage must use ranks 0..7")
     if len(set(vision_ranks)) != sp_size or len(vision_ranks) != sp_size:
         raise ValueError("vision participants must be distinct and match SP")
+
+
+def pack_heads(local, size, capacity):
+    count, heads, dim = local.shape
+    if heads % size or count > capacity:
+        raise ValueError("invalid head split or capacity")
+    output = local.new_zeros((size, capacity, heads // size, dim))
+    output[:, :count] = local.reshape(count, size, heads // size, dim).permute(1, 0, 2, 3)
+    return output
+
+
+def unpack_tokens(received, plan):
+    output = received.new_empty((sum(plan.segment_lengths), *received.shape[2:]))
+    for rank, indices in enumerate(plan.rank_token_indices):
+        ids = torch.tensor(indices, dtype=torch.long, device=received.device)
+        output.index_copy_(0, ids, received[rank, : len(indices)])
+    return output
+
+
+def pack_tokens(full, plan):
+    capacity = max(1, max(map(len, plan.rank_token_indices)))
+    output = full.new_zeros((len(plan.rank_token_indices), capacity, *full.shape[1:]))
+    for rank, indices in enumerate(plan.rank_token_indices):
+        ids = torch.tensor(indices, dtype=torch.long, device=full.device)
+        output[rank, : len(indices)] = full.index_select(0, ids)
+    return output
+
+
+def unpack_heads(received, count):
+    size, capacity, heads, dim = received.shape
+    if count > capacity:
+        raise ValueError("local count exceeds capacity")
+    return received[:, :count].permute(1, 0, 2, 3).reshape(count, size * heads, dim).contiguous()
+
+
+class VisionAllToAll:
+    """Dedicated whole-world prototype; callers coordinate validation failures."""
+
+    def __init__(self, plan):
+        self.plan = plan
+        self.rank = dist.get_rank()
+        self.size = dist.get_world_size()
+        if self.size != len(plan.rank_token_indices):
+            raise ValueError("plan does not match distributed world")
+        self.capacity = max(1, max(map(len, plan.rank_token_indices)))
+        self.calls = 0
+        self.sent_bytes = 0
+
+    def exchange(self, packed):
+        received = torch.empty_like(packed)
+        dist.all_to_all_single(received, packed.contiguous())
+        self.calls += 1
+        self.sent_bytes += packed.numel() * packed.element_size()
+        return received
+
+    def to_heads(self, local):
+        return unpack_tokens(self.exchange(pack_heads(local, self.size, self.capacity)), self.plan)
+
+    def to_tokens(self, full):
+        return unpack_heads(self.exchange(pack_tokens(full, self.plan)), len(self.plan.rank_token_indices[self.rank]))
