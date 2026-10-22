@@ -59,7 +59,7 @@
 ### 2.3 内部接口与文件职责（拟新增，不是已有API）
 
 | 文件，相对个人工作树 | 职责/接口 |
-|---|---|
+| --- | --- |
 | `vllm_omni/diffusion/models/minimax_h3/vision_parallel.py`，新增 | `VisionShardPlan`保存原段长、有效索引、4-token组归属与通信布局；`build_vision_plan(lengths: tuple[int, ...], sp_size: int, merge_size: int) -> VisionShardPlan`；索引scatter/gather、正逆A2A及恢复映射 |
 | `vllm_omni/diffusion/models/minimax_h3/vision_batch.py`，新增 | `VisionBatchPlan`保存同长度分组与逆映射；`build_batch_plan(lengths: tuple[int, ...]) -> VisionBatchPlan`；`run_grouped_attention(q, k, v, *, plan, scale)`使用统一BSHD约定，显式转入后端布局 |
 | `vllm_omni/diffusion/models/minimax_h3/encoder.py`，修改 | VisionAttention/Block/Model接收视觉上下文；拆分视觉和文本加载、驻留与调用；merger与全部DeepStack恢复；保持旧构造/默认forward兼容 |
@@ -126,7 +126,7 @@
 - [ ] 保留以下实验矩阵；服务接入未完成时只对隔离视觉载体执行对应矩阵，明确不作HTTP/DiT前总耗时结论。
 
 | 臂 | runtime资源 | 视觉SP | 组Batch | 用途 |
-|---|---|---:|---|---|
+| --- | --- | ---: | --- | --- |
 | A | 原8卡服务，额外8卡保持空闲 | 1，原8rank重复视觉路径 | off | 同窗固定v1控制臂 |
 | A0 | 新16参与者框架，辅助8rank不算vision | 1，保持原视觉路径 | off | 证明stage接入本身无损，并测框架新增开销 |
 | B | 同A0，后续仍原8卡 | 1 | equal_length | Batch单项净收益 |
@@ -195,3 +195,8 @@ P0已独立提交783101992；本轮新增仅属于Ulysses准备工作。真实�
 任务1配置/源码接入审计已完成；服务角色协议仍待实现。任务2载体代码与CPU测试已完成，NPU同配置重跑未通过环境门：183容器设备namespace冲突，h3-lsy旧vLLM导入当前源码失败，172有他人任务。不得将任务2的NPU出口标记完成；后续先解除环境阻塞，再进入优化实现/性能。详细运行记录在主工作区runs/20261020_h3_ref2va_prompt/vision-ulysses16-batch/183/vision-contract-20261022/runtime-contract.md。
 
 Ruling: 将本阶段载体作为单独提交，不引入尚未验证的真实collective、Batch或服务角色修改；原因是需要先建立可靠对拍基准，环境失败不应驱动业务数学路径变更。代价是NPU出口与U16仍未完成。
+
+## 2026-10-22 后续检查点（取代上文环境阻塞状态）
+
+183新自有兼容容器设备访问已恢复，SP1同配置123点通过，载体提交5b25760fa。隔离Ulysses已实现并验证SP2各rank123点逐位通过。SP4首层Attention失败；单卡重放定位到短段少head调用形状差异，默认关闭的短段重复head诊断选项第一层通过，全层尚待验证。183卡4出现他人任务后停止新NPU启动；CPU17测试及独立代码复核完成。任务4仍进行中，SP8/16、Batch、服务集成、A2和性能出口均未完成。详见主仓vision-ulysses16-batch/183/ulysses-sp2-20261022/report.md。
+最新出口：短段min-heads=8候选在183 A5固定六图完成SP4与SP8各两次123点/rank逐位一致，重跑摘要相同；本地回传校验与独立证据复核完成。用户授权共享窗口只用于正确性，未测性能。下一阶段仍需Batch独立对拍、服务角色接入、真实SP16与A2回归。
