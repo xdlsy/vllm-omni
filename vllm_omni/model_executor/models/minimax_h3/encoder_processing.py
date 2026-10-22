@@ -47,6 +47,11 @@ from vllm_omni.model_executor.models.minimax_h3.timeline_guides import (
     MINIMAX_H3_TIMELINE_GUIDES_KEY,
     prepare_timeline_guides,
 )
+from vllm_omni.profiler.h3_p0 import call as _h3_call
+from vllm_omni.profiler.h3_p0 import profile as _h3_profile
+from vllm_omni.profiler.h3_p0 import scope as _h3_scope
+from vllm_omni.profiler.h3_p0 import stage as _h3_stage
+from vllm_omni.profiler.h3_p0 import submit as _h3_submit
 
 MINIMAX_H3_FPS = 24
 MINIMAX_H3_MIN_OUTPUT_SECONDS = 4.0
@@ -239,6 +244,7 @@ def _resolve_task(
     return "t2va"
 
 
+@_h3_profile("prepare/image_resize")
 def _prepare_encoder_images(
     task: str,
     images: list[Image.Image],
@@ -254,7 +260,9 @@ def _prepare_encoder_images(
         # every denoising step next to the guide anchors.
         max_area = width * height if guided else None
         return [
-            image.resize(
+            _h3_call(
+                "prepare/resize_one",
+                image.resize,
                 resolve_minimax_h3_reference_image_shape(image, max_area=max_area),
                 Image.Resampling.LANCZOS,
             )
@@ -262,14 +270,16 @@ def _prepare_encoder_images(
         ]
     if task != "fl2va":
         return images
-    return [image.resize((width, height), Image.Resampling.LANCZOS) for image in images]
+    return [_h3_call("prepare/resize_one", image.resize, (width, height), Image.Resampling.LANCZOS) for image in images]
 
 
+@_h3_profile("prepare/image_tensorize")
 def _image_to_tensor(image: Image.Image) -> torch.Tensor:
     array = np.asarray(image.convert("RGB"), dtype=np.uint8)
     return torch.from_numpy(np.array(array, copy=True)).contiguous()
 
 
+@_h3_profile("prepare/video_tensorize")
 def _frames_to_tensor(frames: Sequence[Any]) -> torch.Tensor:
     if len(frames) == 0:
         raise ValueError("MiniMax H3 reference video must contain frames")
@@ -475,6 +485,7 @@ def _effective_audio_inputs(
     return audio_inputs
 
 
+@_h3_profile("prepare/encoder_inputs")
 def prepare_encoder_inputs(
     prompt: Any,
     sampling: Any,
@@ -607,7 +618,9 @@ def prepare_encoder_inputs(
                     prepared_reference_videos, expected_count=len(videos)
                 )
                 if prepared_videos is None:
-                    prepared_videos = prepare_reference_videos(
+                    prepared_videos = _h3_call(
+                        "prepare/video_container",
+                        prepare_reference_videos,
                         videos,
                         target_frame_count=num_frames,
                         workdir=workdir,
@@ -616,7 +629,9 @@ def prepare_encoder_inputs(
                 audio_pool = ThreadPoolExecutor(max_workers=1)
                 try:
                     audio_futures = [
-                        audio_pool.submit(
+                        _h3_submit(
+                            "prepare/video_audio_load",
+                            audio_pool,
                             load_video_audio,
                             item["original_path"],
                             start_time_seconds=float(item.get("start_time_seconds", 0.0)),
@@ -630,9 +645,11 @@ def prepare_encoder_inputs(
                         for item in prepared_videos
                     ]
                     for item, audio_future in zip(prepared_videos, audio_futures):
-                        full_frames = load_video_frames(item["prepared_path"])
+                        full_frames = _h3_call("prepare/video_decode", load_video_frames, item["prepared_path"])
                         encoded_video_inputs.append(_frames_to_tensor(full_frames))
-                        sampled = sample_reference_video_frames(
+                        sampled = _h3_call(
+                            "prepare/video_sample",
+                            sample_reference_video_frames,
                             item["prepared_path"],
                             decoded_frames=full_frames,
                         )
@@ -681,7 +698,11 @@ def prepare_encoder_inputs(
                     target_frame_count=num_frames,
                     workdir=workdir,
                 )
-                edit_video_frames = load_video_frames(edit_video_metadata["prepared_path"])
+                edit_video_frames = _h3_call(
+                    "prepare/video_decode",
+                    load_video_frames,
+                    edit_video_metadata["prepared_path"],
+                )
             except subprocess.CalledProcessError as exc:
                 raise OmniClientError("MiniMax H3 could not decode source_video for editing") from exc
             video_edit = _frames_to_tensor(edit_video_frames)
@@ -697,7 +718,9 @@ def prepare_encoder_inputs(
             if edit_video_metadata is not None and not edit_video_metadata["input_has_audio"]:
                 raise OmniClientError("MiniMax H3 source_video has no audio track for audio editing")
             try:
-                waveform, sample_rate = load_video_audio(
+                waveform, sample_rate = _h3_call(
+                    "prepare/video_audio_load",
+                    load_video_audio,
                     str(source_video),
                     duration_seconds=float(num_frames) / MINIMAX_H3_FPS,
                 )
@@ -713,7 +736,7 @@ def prepare_encoder_inputs(
 
     if raw_audio is not None and not lock_audio:
         validate_reference_audio_files(raw_audio)
-    standalone_audios = _load_audios(raw_audio) if raw_audio is not None else []
+    standalone_audios = _h3_call("prepare/audio_load", _load_audios, raw_audio) if raw_audio is not None else []
     if lock_audio:
         waveform, rate = standalone_audios[0]
         if rate <= 0 or waveform.ndim not in (1, 2) or waveform.numel() == 0 or not torch.isfinite(waveform).all():
@@ -760,6 +783,7 @@ def prepare_encoder_inputs(
     )
 
 
+@_h3_profile("vae/image_from_tensor")
 def _image_from_tensor(value: torch.Tensor) -> Image.Image:
     if value.ndim != 3 or value.shape[-1] != 3:
         raise ValueError(f"MiniMax H3 image tensor must have shape [H, W, 3], got {tuple(value.shape)}")
@@ -827,6 +851,7 @@ def _timeline_guide_conditioning(
     )
 
 
+@_h3_profile("vae/encode_media")
 def encode_media(
     media: MiniMaxH3EncoderMediaInput,
     *,
@@ -859,19 +884,20 @@ def encode_media(
     if media.images or media.videos or media.video_edit is not None or has_guide_frames:
         if video_vae is None:
             raise RuntimeError("MiniMax H3 video VAE is not resident on this rank")
-        with component_scope(video_vae):
-            for value in media.images:
-                image = _image_from_tensor(value)
-                visual_rows.append(video_vae.encode_image(image))
-                visual_shapes.append((1, image.height // 16, image.width // 16))
+        with _h3_scope("vae/component", component_scope(video_vae)):
+            for media_index, value in enumerate(media.images):
+                with _h3_stage("vae/image", media_id=media_index, media_kind="image"):
+                    image = _image_from_tensor(value)
+                    visual_rows.append(video_vae.encode_image(image))
+                    visual_shapes.append((1, image.height // 16, image.width // 16))
             for value in media.videos:
                 frames = np.asarray(value.detach().cpu().to(torch.uint8).contiguous().numpy())
-                rows, shape = video_vae.encode_video(frames)
+                rows, shape = _h3_call("vae/video", video_vae.encode_video, frames)
                 visual_rows.append(rows)
                 visual_shapes.append(tuple(int(item) for item in shape))
             if media.video_edit is not None:
                 frames = np.asarray(media.video_edit.detach().cpu().to(torch.uint8).contiguous().numpy())
-                rows, shape = video_vae.encode_video(frames)
+                rows, shape = _h3_call("vae/video", video_vae.encode_video, frames)
                 shape = tuple(int(item) for item in shape)
                 expected_shape = (media.latent_t, media.height // 16, media.width // 16)
                 expected_rows = media.latent_t * (media.height // 32) * (media.width // 32)
@@ -898,14 +924,14 @@ def encode_media(
     if audio_inputs or media.audio_edit is not None:
         if audio_vae is None:
             raise RuntimeError("MiniMax H3 audio WVAE is not resident on the encoder leader")
-        with component_scope(audio_vae):
+        with _h3_scope("vae/audio_component", component_scope(audio_vae)):
             for waveform, sample_rate in audio_inputs:
-                rows, length = audio_vae.encode_waveform(waveform, sample_rate)
+                rows, length = _h3_call("vae/audio", audio_vae.encode_waveform, waveform, sample_rate)
                 audio_rows.append(rows)
                 audio_lengths.append(int(length))
             if media.audio_edit is not None:
                 waveform, sample_rate = media.audio_edit
-                rows, source_audio_t = audio_vae.encode_waveform(waveform, sample_rate)
+                rows, source_audio_t = _h3_call("vae/audio", audio_vae.encode_waveform, waveform, sample_rate)
                 rows = rows.to(dtype=torch.float32).contiguous()
                 audio_edit_clean_rows, audio_edit_source_t = _fit_audio_edit_rows(
                     rows,

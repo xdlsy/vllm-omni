@@ -23,6 +23,15 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_total_steps,
 )
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.profiler.h3_p0 import (
+    call as _h3_call,
+)
+from vllm_omni.profiler.h3_p0 import (
+    first_dit as _h3_first_dit,
+)
+from vllm_omni.profiler.h3_p0 import (
+    profile as _h3_profile,
+)
 
 from .latent_mask import MiniMaxH3LatentEdit, minimax_h3_prepare_edit_rows
 from .sampling import create_h3_sample_solver
@@ -163,6 +172,7 @@ class MiniMaxH3DenoiseBranch:
                 latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
             )
 
+    @_h3_profile("dit/rope_table")
     def prepare_rope_table(self, model: Any) -> None:
         """Materialize the branch-local DiT RoPE table once per denoise run.
 
@@ -179,6 +189,7 @@ class MiniMaxH3DenoiseBranch:
             seq_len=self.seq_len,
         )
 
+    @_h3_profile("dit/step_inputs")
     def forward_kwargs(
         self,
         *,
@@ -265,6 +276,7 @@ class MiniMaxH3DenoiseBranch:
             timesteps[positions[~update_mask]] = condition_timestep
 
 
+@_h3_profile("dit/prepare_rows")
 def minimax_h3_prepare_denoise_rows(
     *,
     positive: MiniMaxH3DenoiseBranch,
@@ -384,7 +396,9 @@ def minimax_h3_denoise_loop(
             imgvid_cond_t = max(t_v, float(imgvid_cond_noise_aug_for_inference))
             audio_ref_cond_t = max(t_a, float(audio_cond_noise_aug_for_inference))
 
-            model_video_rows, video_target_timesteps = minimax_h3_prepare_edit_rows(
+            model_video_rows, video_target_timesteps = _h3_call(
+                "dit/edit_rows",
+                minimax_h3_prepare_edit_rows,
                 video_rows,
                 update,
                 video_edit,
@@ -392,7 +406,9 @@ def minimax_h3_denoise_loop(
                 imgvid_cond_t,
                 sigma=s_v,
             )
-            model_audio_rows, audio_target_timesteps = minimax_h3_prepare_edit_rows(
+            model_audio_rows, audio_target_timesteps = _h3_call(
+                "dit/edit_rows",
+                minimax_h3_prepare_edit_rows,
                 audio_rows,
                 audio_update,
                 audio_edit,
@@ -414,6 +430,8 @@ def minimax_h3_denoise_loop(
             if getattr(getattr(model, "arch", None), "pdd_steps", None) is not None:
                 fk["pdd_step"] = step
             with torch.inference_mode():
+                if step == 0:
+                    _h3_first_dit(step=step)
                 v_video, v_audio = model(**fk)
             mv_video_t = v_video.float()[update]
             mv_audio_t = v_audio.float()[audio_update]

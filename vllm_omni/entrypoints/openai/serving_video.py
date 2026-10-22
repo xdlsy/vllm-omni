@@ -48,6 +48,18 @@ from vllm_omni.outputs.output_metadata import (
     DiffusionMultimodalOutput,
     DiffusionPayloadValue,
 )
+from vllm_omni.profiler.h3_p0 import (
+    annotate as _h3_annotate,
+)
+from vllm_omni.profiler.h3_p0 import (
+    event as _h3_event,
+)
+from vllm_omni.profiler.h3_p0 import (
+    profile as _h3_profile,
+)
+from vllm_omni.profiler.h3_p0 import (
+    request as _h3_request,
+)
 
 logger = init_logger(__name__)
 
@@ -310,6 +322,7 @@ class OmniOpenAIServingVideo:
     async def abort_request(self, request_id: str) -> None:
         await self._engine_client.abort(request_id, timeout=ABORT_TIMEOUT_S)
 
+    @_h3_profile("api/build_and_generate")
     async def _run_and_extract(
         self,
         request: VideoGenerationRequest,
@@ -743,52 +756,56 @@ class OmniOpenAIServingVideo:
         *,
         on_started: Callable[[], Awaitable[None]] | None = None,
     ) -> object:
-        stage_configs = self._stage_configs or getattr(self._engine_client, "stage_configs", None)
+        _h3_annotate(request_id=request_id)
+        with _h3_request(request_id, force=True, role="api_generation"):
+            stage_configs = self._stage_configs or getattr(self._engine_client, "stage_configs", None)
 
-        if not stage_configs:
-            raise HTTPException(
-                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-                detail="Stage configs not found. Start server with an omni diffusion model.",
+            if not stage_configs:
+                raise HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                    detail="Stage configs not found. Start server with an omni diffusion model.",
+                )
+
+            # Video pipelines may use preparatory AR stages (for example, a
+            # vLLM-hosted text encoder) before the diffusion stage.
+            if not is_video_generation_pipeline(stage_configs):
+                raise HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                    detail="No final video output stage found in video generation pipeline.",
+                )
+
+            # Common generation logic for both paths
+            engine_client = cast(AsyncOmni, self._engine_client)
+            gen_params.emit_request_lifecycle = on_started is not None
+            sampling_params_list = build_stage_sampling_params_list(
+                list(stage_configs),
+                get_default_sampling_params_list(engine_client),
+                diffusion_params=gen_params,
+                replace_diffusion_params=True,
             )
 
-        # Video pipelines may use preparatory AR stages (for example, a
-        # vLLM-hosted text encoder) before the diffusion stage.
-        if not is_video_generation_pipeline(stage_configs):
-            raise HTTPException(
-                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-                detail="No final video output stage found in video generation pipeline.",
-            )
+            result = None
+            started_notified = False
+            _h3_event("engine/submit", request_id=request_id)
+            async for output in engine_client.generate(
+                prompt=prompt,
+                request_id=request_id,
+                sampling_params_list=sampling_params_list,
+            ):
+                if is_diffusion_request_started_output(output):
+                    _h3_event("engine/started_notification", request_id=request_id)
+                    if on_started is not None and not started_notified:
+                        await on_started()
+                        started_notified = True
+                    continue
+                result = output
 
-        # Common generation logic for both paths
-        engine_client = cast(AsyncOmni, self._engine_client)
-        gen_params.emit_request_lifecycle = on_started is not None
-        sampling_params_list = build_stage_sampling_params_list(
-            list(stage_configs),
-            get_default_sampling_params_list(engine_client),
-            diffusion_params=gen_params,
-            replace_diffusion_params=True,
-        )
-
-        result = None
-        started_notified = False
-        async for output in engine_client.generate(
-            prompt=prompt,
-            request_id=request_id,
-            sampling_params_list=sampling_params_list,
-        ):
-            if is_diffusion_request_started_output(output):
-                if on_started is not None and not started_notified:
-                    await on_started()
-                    started_notified = True
-                continue
-            result = output
-
-        if result is None:
-            raise HTTPException(
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
-                detail="No output generated from video generation pipeline.",
-            )
-        return result
+            if result is None:
+                raise HTTPException(
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                    detail="No output generated from video generation pipeline.",
+                )
+            return result
 
     @staticmethod
     def _normalize_video_outputs(videos: DiffusionPayloadValue | None) -> list[DiffusionPayloadValue]:

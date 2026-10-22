@@ -38,6 +38,7 @@ from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.profiler.h3_p0 import event as _h3_event
 
 if TYPE_CHECKING:
     from vllm.tokenizers import TokenizerLike
@@ -178,6 +179,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # only for internal tracking throughout the request's life.
         external_request_id = request_id
         request_id = self._get_unique_request_id(external_request_id)
+        _h3_event(
+            "engine/request_id_map",
+            external_request_id=external_request_id,
+            internal_request_id=request_id,
+        )
 
         # Wait until generation is resumed if the engine is paused. Non-streaming
         # generate holds an admission slot until add_request completes so sleep()
