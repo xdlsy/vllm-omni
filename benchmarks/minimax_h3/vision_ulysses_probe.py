@@ -82,7 +82,7 @@ def segment_attention(q, k, v, *, short_min_heads=0):
     return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
 
 
-def sharded_forward(model, pixels, grid, transport, checks, rotate, *, short_min_heads=0):
+def sharded_forward(model, pixels, grid, transport, checks, rotate, *, short_min_heads=0, batch=False, stats=None):
     """Keep hidden states sharded between blocks; global metadata is replicated."""
     plan = transport.plan
     ids = plan.rank_token_indices[transport.rank]
@@ -111,7 +111,20 @@ def sharded_forward(model, pixels, grid, transport, checks, rotate, *, short_min
         q, k = rotate(q, k, cos, sin)
         q, k, v = [transport.to_heads(tensor).transpose(0, 1).unsqueeze(0) for tensor in (q, k, v)]
         splits = [torch.split(tensor, plan.segment_lengths, dim=2) for tensor in (q, k, v)]
-        outputs = [segment_attention(qi, ki, vi, short_min_heads=short_min_heads) for qi, ki, vi in zip(*splits)]
+
+        def attend(q, k, v):
+            if stats is not None:
+                stats["sdpa_calls"] = stats.get("sdpa_calls", 0) + 1
+                stats["batched_calls"] = stats.get("batched_calls", 0) + (q.shape[0] > 1)
+            return segment_attention(q, k, v, short_min_heads=short_min_heads)
+
+        if batch:
+            from vllm_omni.diffusion.models.minimax_h3 import vision_batch
+
+            verify_module_source(vision_batch, "vllm_omni/diffusion/models/minimax_h3/vision_batch.py")
+            outputs = vision_batch.run_grouped_attention(*splits, attention=attend)
+        else:
+            outputs = [attend(qi, ki, vi) for qi, ki, vi in zip(*splits)]
         full = torch.cat(outputs, dim=2).squeeze(0).transpose(0, 1).contiguous()
         local = transport.to_tokens(full).reshape(len(ids), model.config.hidden_size)
         projected = attention.proj(local)
@@ -157,7 +170,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("case", "model-root", "refs-dir", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
-    parser.add_argument("--sp-size", type=int, choices=(2, 4, 8, 16), required=True)
+    parser.add_argument("--sp-size", type=int, choices=(1, 2, 4, 8, 16), required=True)
+    parser.add_argument("--batch", action="store_true")
     parser.add_argument("--short-sdpa-min-heads", type=int, choices=(0, 8), default=0)
     args = parser.parse_args()
     if int(os.environ["WORLD_SIZE"]) != args.sp_size:
@@ -176,7 +190,9 @@ def main():
         "local_rank": local_rank,
         "world_size": args.sp_size,
         "passed": False,
-        "scope": "isolated SP, Batch off; not serving or performance",
+        "scope": "isolated vision; not serving or performance",
+        "batch": args.batch,
+        "attention_stats": {},
         "short_sdpa_min_heads": args.short_sdpa_min_heads,
         "short_sdpa_max_tokens": 1024,
     }
@@ -218,6 +234,7 @@ def main():
                 str(source_root / name): digest(source_root / name)
                 for name in (
                     "benchmarks/minimax_h3/vision_encoding_probe.py",
+                    "vllm_omni/diffusion/models/minimax_h3/vision_batch.py",
                     "vllm_omni/model_executor/models/minimax_h3/preprocessing.py",
                     "vllm_omni/model_executor/models/minimax_h3/encoder_processing.py",
                 )
@@ -248,6 +265,8 @@ def main():
                 checks,
                 encoder._apply_rotary_pos_emb_vision,
                 short_min_heads=args.short_sdpa_min_heads,
+                batch=args.batch,
+                stats=report["attention_stats"],
             )
         checks.finish()
         report["passed"] = True
