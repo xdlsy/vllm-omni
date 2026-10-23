@@ -54,6 +54,7 @@ implementation contract; it is not, by itself, a general support claim.
 - [Hybrid Sharded Data Parallel (HSDP)](feature/hsdp.md)
 - [Pipeline Parallel](feature/pipeline_parallel.md)
 - [Sequence Parallel](feature/sequence_parallel.md)
+- [MiniMax H3 Vision Sequence Parallelism](feature/minimax_h3_vision_parallel.md)
 - [Tensor Parallel](feature/tensor_parallel.md)
 - [VAE Patch Parallelism](feature/vae_parallel.md)
 - [Noisy KV](feature/noisy_kv.md)
