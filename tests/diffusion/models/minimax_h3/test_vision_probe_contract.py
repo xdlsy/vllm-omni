@@ -32,6 +32,58 @@ class VisionContractTests(unittest.TestCase):
     parallel: ModuleType
     probe: ModuleType
 
+    def test_merger_row_guard_preserves_whole_group_mapping(self):
+        with patch.dict(sys.modules, {"vision_encoding_probe": self.probe}):
+            runner = load_file("vision_merger_mode_test", "benchmarks/minimax_h3/vision_ulysses_probe.py")
+        local = torch.arange(16.0).reshape(8, 2)
+        select = torch.tensor([4, 5, 6, 7, 12, 13, 14, 15])
+        merged = torch.tensor([1, 3])
+        seen = []
+
+        def merger(x):
+            seen.append(x.clone())
+            return x.reshape(-1, 4, 2).sum(dim=1)
+
+        actual = runner.merge_tokens(merger, local, select, merged, 20, preserve_rows=True)
+        self.assertTrue(torch.equal(actual, local.reshape(2, 4, 2).sum(dim=1)))
+        self.assertEqual(seen[0].shape, (20, 2))
+        self.assertTrue(torch.equal(seen[0][select], local))
+
+    def test_projection_row_guard_retains_global_positions(self):
+        with patch.dict(sys.modules, {"vision_encoding_probe": self.probe}):
+            runner = load_file("vision_projection_mode_test", "benchmarks/minimax_h3/vision_ulysses_probe.py")
+        local = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        select = torch.tensor([2, 7])
+        seen = []
+
+        def project(x):
+            seen.append(x.clone())
+            return x * 2 + 1
+
+        actual = runner.project_tokens(project, local, select, 10, preserve_rows=True)
+        self.assertTrue(torch.equal(actual, local * 2 + 1))
+        self.assertEqual(seen[0].shape, (10, 2))
+        self.assertTrue(torch.equal(seen[0][select], local))
+        self.assertEqual(torch.count_nonzero(seen[0][[0, 1, 3, 4, 5, 6, 8, 9]]).item(), 0)
+
+    def test_replicated_patch_preserves_reference_batch_shape(self):
+        with patch.dict(sys.modules, {"vision_encoding_probe": self.probe}):
+            runner = load_file("vision_patch_mode_test", "benchmarks/minimax_h3/vision_ulysses_probe.py")
+        pixels = torch.arange(30).reshape(10, 3)
+        select = torch.tensor([1, 7])
+        seen = []
+
+        def embed(x):
+            seen.append(len(x))
+            return x * 2
+
+        actual = runner.embed_tokens(embed, pixels, select, replicated=True)
+        self.assertEqual(seen, [10])
+        self.assertTrue(torch.equal(actual, (pixels * 2)[select]))
+        seen.clear()
+        runner.embed_tokens(embed, pixels, select, replicated=False)
+        self.assertEqual(seen, [2])
+
     @classmethod
     def setUpClass(cls):
         cls.parallel = load_file(

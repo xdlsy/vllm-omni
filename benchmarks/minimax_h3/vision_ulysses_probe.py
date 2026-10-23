@@ -3,7 +3,9 @@
 """Experimental Ulysses correctness runner, launched with torchrun.
 
 No serving integration or timing claims. A fresh full reference runs on rank0;
-candidate ranks compute only their own tokens. First inequality stops all ranks.
+Candidate ranks shard tokens between blocks. Optional compatibility guards
+replicate PatchEmbed and preserve full global rows for projection and mergers;
+these guards add computation and memory. First inequality stops all ranks.
 Unexpected exceptions are bounded by the process-group and launcher timeouts.
 """
 
@@ -82,15 +84,62 @@ def segment_attention(q, k, v, *, short_min_heads=0):
     return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
 
 
-def sharded_forward(model, pixels, grid, transport, checks, rotate, *, short_min_heads=0, batch=False, stats=None):
+def embed_tokens(embed, pixels, select, *, replicated=False):
+    """Opt-in reference batch shape for A3 Conv3D bitwise compatibility.
+
+    This repeats PatchEmbed computation on all ranks; later blocks stay sharded.
+    """
+    if replicated:
+        return embed(pixels).index_select(0, select)
+    return embed(pixels.index_select(0, select))
+
+
+def project_tokens(project, local, select, total_rows, *, preserve_rows=False):
+    """Diagnostic A3 compatibility: retain original global rows for projection.
+
+    Full-size zero-filled GEMM repeats computation; no scaling benefit claimed.
+    """
+    if not preserve_rows:
+        return project(local)
+    full = local.new_zeros((total_rows, local.shape[1]))
+    full.index_copy_(0, select, local)
+    return project(full).index_select(0, select)
+
+
+def merge_tokens(merger, local, select, merged_select, total_rows, *, preserve_rows=False):
+    """Opt-in full global row layout for A3 merger linear compatibility."""
+    if not preserve_rows:
+        return merger(local)
+    full = local.new_zeros((total_rows, local.shape[1]))
+    full.index_copy_(0, select, local)
+    return merger(full).index_select(0, merged_select)
+
+
+def sharded_forward(
+    model,
+    pixels,
+    grid,
+    transport,
+    checks,
+    rotate,
+    *,
+    short_min_heads=0,
+    batch=False,
+    stats=None,
+    replicated_patch=False,
+    preserve_projection_rows=False,
+    preserve_merger_rows=False,
+    preserve_qkv_rows=False,
+):
     """Keep hidden states sharded between blocks; global metadata is replicated."""
     plan = transport.plan
     ids = plan.rank_token_indices[transport.rank]
     merged_ids = plan.rank_merger_indices[transport.rank]
     select = torch.tensor(ids, dtype=torch.long, device=pixels.device)
+    merged_select = torch.tensor(merged_ids, dtype=torch.long, device=pixels.device)
     checks.check("input/0", pixels)
     checks.check("input/1", grid)
-    hidden = model.patch_embed(pixels.index_select(0, select))
+    hidden = embed_tokens(model.patch_embed, pixels, select, replicated=replicated_patch)
     checks.check("patch_embed", hidden, ids)
     hidden = hidden + model.fast_pos_embed_interpolate(grid).index_select(0, select)
     checks.check("block0_input", hidden, ids)
@@ -105,7 +154,9 @@ def sharded_forward(model, pixels, grid, transport, checks, rotate, *, short_min
     for number, block in enumerate(model.blocks):
         prefix = f"blocks.{number}"
         attention = block.attn
-        qkv = attention.qkv(block.norm1(hidden))
+        qkv = project_tokens(
+            attention.qkv, block.norm1(hidden), select, sum(plan.segment_lengths), preserve_rows=preserve_qkv_rows
+        )
         checks.check(prefix + ".attn.qkv", qkv, ids)
         q, k, v = qkv.reshape(len(ids), 3, attention.num_heads, attention.head_dim).permute(1, 0, 2, 3).unbind(0)
         q, k = rotate(q, k, cos, sin)
@@ -127,7 +178,9 @@ def sharded_forward(model, pixels, grid, transport, checks, rotate, *, short_min
             outputs = [attend(qi, ki, vi) for qi, ki, vi in zip(*splits)]
         full = torch.cat(outputs, dim=2).squeeze(0).transpose(0, 1).contiguous()
         local = transport.to_tokens(full).reshape(len(ids), model.config.hidden_size)
-        projected = attention.proj(local)
+        projected = project_tokens(
+            attention.proj, local, select, sum(plan.segment_lengths), preserve_rows=preserve_projection_rows
+        )
         checks.check(prefix + ".attn", projected, ids)
         hidden = hidden + projected
         mlp = block.mlp(block.norm2(hidden))
@@ -136,10 +189,19 @@ def sharded_forward(model, pixels, grid, transport, checks, rotate, *, short_min
         checks.check(prefix, hidden, ids)
         if number in model.deepstack_visual_indexes:
             deep_index = model.deepstack_visual_indexes.index(number)
-            output = model.deepstack_merger_list[deep_index](hidden)
+            output = merge_tokens(
+                model.deepstack_merger_list[deep_index],
+                hidden,
+                select,
+                merged_select,
+                sum(plan.segment_lengths),
+                preserve_rows=preserve_merger_rows,
+            )
             checks.check(f"deepstack_merger_list.{deep_index}", output, merged_ids)
             deepstack.append(output)
-    final = model.merger(hidden)
+    final = merge_tokens(
+        model.merger, hidden, select, merged_select, sum(plan.segment_lengths), preserve_rows=preserve_merger_rows
+    )
     checks.check("merger", final, merged_ids)
     checks.check("final/0", final, merged_ids)
     for index, output in enumerate(deepstack):
@@ -172,6 +234,10 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--sp-size", type=int, choices=(1, 2, 4, 8, 16), required=True)
     parser.add_argument("--batch", action="store_true")
+    parser.add_argument("--replicate-patch-embed", action="store_true")
+    parser.add_argument("--preserve-projection-rows", action="store_true")
+    parser.add_argument("--preserve-merger-rows", action="store_true")
+    parser.add_argument("--preserve-qkv-rows", action="store_true")
     parser.add_argument("--short-sdpa-min-heads", type=int, choices=(0, 8), default=0)
     args = parser.parse_args()
     if int(os.environ["WORLD_SIZE"]) != args.sp_size:
@@ -192,6 +258,10 @@ def main():
         "passed": False,
         "scope": "isolated vision; not serving or performance",
         "batch": args.batch,
+        "replicated_patch_embed": args.replicate_patch_embed,
+        "preserve_projection_rows": args.preserve_projection_rows,
+        "preserve_merger_rows": args.preserve_merger_rows,
+        "preserve_qkv_rows": args.preserve_qkv_rows,
         "attention_stats": {},
         "short_sdpa_min_heads": args.short_sdpa_min_heads,
         "short_sdpa_max_tokens": 1024,
@@ -267,6 +337,10 @@ def main():
                 short_min_heads=args.short_sdpa_min_heads,
                 batch=args.batch,
                 stats=report["attention_stats"],
+                replicated_patch=args.replicate_patch_embed,
+                preserve_projection_rows=args.preserve_projection_rows,
+                preserve_merger_rows=args.preserve_merger_rows,
+                preserve_qkv_rows=args.preserve_qkv_rows,
             )
         checks.finish()
         report["passed"] = True
