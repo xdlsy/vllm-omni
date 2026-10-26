@@ -23,6 +23,27 @@ def segment_attention(q, k, v):
     return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
 
 
+def tnd_attention(q, k, v, lengths):
+    """Run independent image sequences in one NPU variable-length attention call."""
+    import torch_npu
+
+    ends = []
+    for length in lengths:
+        ends.append(length + (ends[-1] if ends else 0))
+    inputs = [tensor.squeeze(0).transpose(0, 1).contiguous() for tensor in (q, k, v)]
+    return torch_npu.npu_fusion_attention(
+        *inputs,
+        head_num=q.shape[1],
+        input_layout="TND",
+        scale=q.shape[-1] ** -0.5,
+        keep_prob=1.0,
+        actual_seq_qlen=ends,
+        actual_seq_kvlen=ends,
+        sparse_mode=0,
+        inner_precise=0,
+    )[0]
+
+
 def forward_sp8(model, pixels, grid, *, group):
     """Shard whole spatial merger groups, exchange heads, then gather all outputs."""
     lengths = tuple(h * w for t, h, w in grid.cpu().tolist() for _ in range(t))
@@ -79,8 +100,29 @@ def attention_sp8(attention, hidden, position_embeddings, transport, rotate):
     q, k, v = qkv.reshape(hidden.shape[0], 3, attention.num_heads, attention.head_dim).permute(1, 0, 2, 3).unbind(0)
     q, k = rotate(q, k, *position_embeddings)
     q, k, v = [transport.to_heads(tensor).transpose(0, 1).unsqueeze(0) for tensor in (q, k, v)]
-    splits = [torch.split(tensor, transport.plan.segment_lengths, dim=2) for tensor in (q, k, v)]
-    outputs = [segment_attention(qi, ki, vi) for qi, ki, vi in zip(*splits)]
-    full = torch.cat(outputs, dim=2).squeeze(0).transpose(0, 1).contiguous()
+    use_tnd = vision_permutation_enabled("VLLM_OMNI_H3_VISION_TND")
+    verify_tnd = vision_permutation_enabled("VLLM_OMNI_H3_VISION_TND_VERIFY")
+    if verify_tnd and not use_tnd:
+        raise ValueError("VLLM_OMNI_H3_VISION_TND_VERIFY requires VLLM_OMNI_H3_VISION_TND=1")
+    if use_tnd:
+        full = tnd_attention(q, k, v, transport.plan.segment_lengths)
+    if not use_tnd or verify_tnd:
+        splits = [torch.split(tensor, transport.plan.segment_lengths, dim=2) for tensor in (q, k, v)]
+        outputs = [segment_attention(qi, ki, vi) for qi, ki, vi in zip(*splits)]
+        reference = torch.cat(outputs, dim=2).squeeze(0).transpose(0, 1).contiguous()
+        if not use_tnd:
+            full = reference
+        else:
+            failed = (
+                full.shape != reference.shape
+                or full.dtype != reference.dtype
+                or full.stride() != reference.stride()
+                or not torch.isfinite(full).all().item()
+                or not torch.equal(full.contiguous().view(torch.uint8), reference.contiguous().view(torch.uint8))
+            )
+            status = torch.tensor([int(failed)], dtype=torch.int32, device=full.device)
+            dist.all_reduce(status, op=dist.ReduceOp.MAX, group=transport.group)
+            if status.item():
+                raise RuntimeError("vision TND attention changed bytes or strides")
     local = transport.to_tokens(full).reshape(hidden.shape[0], attention.num_heads * attention.head_dim)
     return attention.proj(local)

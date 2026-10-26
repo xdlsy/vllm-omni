@@ -87,7 +87,11 @@ def test_empty_rank_shard_keeps_explicit_hidden_dimension():
     path = Path(__file__).resolve().parents[4] / "vllm_omni/diffusion/models/minimax_h3/vision_sp.py"
     tree = ast.parse(path.read_text())
     function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "attention_sp8")
-    namespace = {"torch": torch, "segment_attention": lambda q, k, v: v}
+    namespace = {
+        "torch": torch,
+        "segment_attention": lambda q, k, v: v,
+        "vision_permutation_enabled": lambda name: False,
+    }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
     attention = SimpleNamespace(num_heads=16, head_dim=2, qkv=lambda x: x.new_empty((0, 96)), proj=lambda x: x)
     transport = SimpleNamespace(
