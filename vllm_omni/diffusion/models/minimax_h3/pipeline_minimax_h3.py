@@ -102,6 +102,19 @@ from vllm_omni.model_executor.models.minimax_h3.timeline_guides import (
     resolve_guide_start,
 )
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.profiler.h3_p0 import (
+    annotate as _h3_annotate,
+)
+from vllm_omni.profiler.h3_p0 import (
+    call as _h3_call,
+)
+from vllm_omni.profiler.h3_p0 import (
+    profile as _h3_profile,
+)
+from vllm_omni.profiler.h3_p0 import (
+    scope as _h3_scope,
+)
+from vllm_omni.profiler.h3_p0 import submit as _h3_submit
 from vllm_omni.quantization import (
     resolve_component_quant_config as _resolve_component_quant_config,
 )
@@ -564,7 +577,7 @@ def _broadcast_rank0_exception(exc: Exception | None) -> None:
             ]
     else:
         payload = [None]
-    dist.broadcast_object_list(payload, src=0, group=group)
+    _h3_call("prepare/error_broadcast", dist.broadcast_object_list, payload, src=0, group=group)
     info = payload[0]
     if info is None:
         return
@@ -596,7 +609,7 @@ def _broadcast_tensor(
     if world_size == 1:
         if tensor is None:
             raise ValueError("source tensor is required for single-rank execution")
-        return tensor.to(device=device, dtype=dtype)
+        return _h3_call("transfer/payload_to", tensor.to, device=device, dtype=dtype)
 
     shape = torch.zeros(5, dtype=torch.long, device=device)
     if rank == 0:
@@ -607,14 +620,25 @@ def _broadcast_tensor(
             tensor.shape,
             device=device,
         )
-    dist.broadcast(shape, src=0, group=group)
-    ndim = int(shape[0].item())
-    tensor_shape = tuple(int(v) for v in shape[1 : ndim + 1].tolist())
+    _h3_call("transfer/world_broadcast", dist.broadcast, shape, src=0, group=group)
+    ndim = int(
+        _h3_call(
+            "transfer/shape_readback",
+            shape[0].item,
+        )
+    )
+    tensor_shape = tuple(
+        int(v)
+        for v in _h3_call(
+            "transfer/shape_readback",
+            shape[1 : ndim + 1].tolist,
+        )
+    )
     if rank == 0:
-        output = tensor.to(device=device, dtype=dtype).contiguous()
+        output = _h3_call("transfer/payload_to", tensor.to, device=device, dtype=dtype).contiguous()
     else:
         output = torch.empty(tensor_shape, device=device, dtype=dtype)
-    dist.broadcast(output, src=0, group=group)
+    _h3_call("transfer/world_broadcast", dist.broadcast, output, src=0, group=group)
     return output
 
 
@@ -1498,7 +1522,7 @@ class MiniMaxH3Pipeline(
         if group.world_size == 1:
             if tensor is None:
                 raise ValueError("source tensor is required for single-rank execution")
-            return tensor.to(device=device, dtype=dtype)
+            return _h3_call("qwen/input_payload_to", tensor.to, device=device, dtype=dtype)
 
         shape = torch.zeros(8, dtype=torch.long, device=device)
         if group.rank_in_group == 0:
@@ -1506,16 +1530,40 @@ class MiniMaxH3Pipeline(
                 raise ValueError("encoder rank 0 must provide a tensor to broadcast")
             shape[0] = tensor.ndim
             shape[1 : tensor.ndim + 1] = torch.tensor(tensor.shape, device=device)
-        torch.distributed.broadcast(shape, src=group.ranks[0], group=group.device_group)
-        ndim = int(shape[0].item())
-        tensor_shape = tuple(int(value) for value in shape[1 : ndim + 1].tolist())
+        _h3_call(
+            "qwen/input_broadcast",
+            torch.distributed.broadcast,
+            shape,
+            src=group.ranks[0],
+            group=group.device_group,
+        )
+        ndim = int(
+            _h3_call(
+                "qwen/input_shape_readback",
+                shape[0].item,
+            )
+        )
+        tensor_shape = tuple(
+            int(value)
+            for value in _h3_call(
+                "qwen/input_shape_readback",
+                shape[1 : ndim + 1].tolist,
+            )
+        )
         if group.rank_in_group == 0:
-            output = tensor.to(device=device, dtype=dtype).contiguous()
+            output = _h3_call("qwen/input_payload_to", tensor.to, device=device, dtype=dtype).contiguous()
         else:
             output = torch.empty(tensor_shape, device=device, dtype=dtype)
-        torch.distributed.broadcast(output, src=group.ranks[0], group=group.device_group)
+        _h3_call(
+            "qwen/input_broadcast",
+            torch.distributed.broadcast,
+            output,
+            src=group.ranks[0],
+            group=group.device_group,
+        )
         return output
 
+    @_h3_profile("qwen/distribute_inputs")
     def _distribute_encode_inputs(
         self,
         ids: torch.Tensor | None,
@@ -1534,6 +1582,7 @@ class MiniMaxH3Pipeline(
             "video_grid_thw": torch.long,
         }
         group = self.text_encoder_group
+        _h3_annotate(encoder_group_ranks=group.ranks, encoder_tp_size=group.world_size)
         device = self.device
         if group.world_size == 1:
             if ids is None:
@@ -1544,14 +1593,26 @@ class MiniMaxH3Pipeline(
         if group.rank_in_group == 0:
             for index, key in enumerate(keys):
                 mask[index] = 1 if key in vision_kwargs else 0
-        torch.distributed.broadcast(mask, src=group.ranks[0], group=group.device_group)
+        _h3_call(
+            "qwen/input_presence_broadcast",
+            torch.distributed.broadcast,
+            mask,
+            src=group.ranks[0],
+            group=group.device_group,
+        )
 
         if group.rank_in_group == 0:
             ids = self._encoder_group_broadcast_tensor(ids, dtype=torch.long, device=device)
         else:
             ids = self._encoder_group_broadcast_tensor(None, dtype=torch.long, device=device)
         for index, key in enumerate(keys):
-            if mask[index].item() == 0:
+            if (
+                _h3_call(
+                    "qwen/input_presence_readback",
+                    mask[index].item,
+                )
+                == 0
+            ):
                 continue
             source = vision_kwargs.get(key) if group.rank_in_group == 0 else None
             vision_kwargs[key] = self._encoder_group_broadcast_tensor(
@@ -1561,6 +1622,7 @@ class MiniMaxH3Pipeline(
             )
         return ids
 
+    @_h3_profile("qwen/encode_hidden")
     def _encode_text_hidden(
         self,
         input_ids: torch.Tensor,
@@ -1572,11 +1634,14 @@ class MiniMaxH3Pipeline(
             return self.text_encoder(input_ids, **vision_kwargs)
 
         if self._uses_manual_component_offload(self.text_encoder):
-            with self._component_on_device(self.text_encoder):
+            with _h3_scope("qwen/component", self._component_on_device(self.text_encoder)):
                 return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
 
         # Keep Qwen resident when it is not selected for layerwise offload.
-        self.text_encoder.load_to_device()
+        _h3_call(
+            "qwen/load",
+            self.text_encoder.load_to_device,
+        )
         return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
 
     def _uses_manual_component_offload(self, component: nn.Module) -> bool:
@@ -1671,12 +1736,18 @@ class MiniMaxH3Pipeline(
         staged = self._uses_manual_component_offload(component)
         try:
             if staged:
-                component.load_to_device()
+                _h3_call(
+                    "residency/load",
+                    component.load_to_device,
+                )
             yield
         except BaseException:
             if staged:
                 try:
-                    component.offload_to_cpu()
+                    _h3_call(
+                        "residency/offload",
+                        component.offload_to_cpu,
+                    )
                 except BaseException:
                     logger.exception("Failed to release %s after component failure", component.__class__.__name__)
                 cache = getattr(self, "_dlo_component_cache", None)
@@ -1689,7 +1760,10 @@ class MiniMaxH3Pipeline(
         else:
             if staged:
                 try:
-                    component.offload_to_cpu()
+                    _h3_call(
+                        "residency/offload",
+                        component.offload_to_cpu,
+                    )
                 except BaseException:
                     cache = getattr(self, "_dlo_component_cache", None)
                     if cache is not None:
@@ -1772,6 +1846,7 @@ class MiniMaxH3Pipeline(
             return tensor.cpu()
         return torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
 
+    @_h3_profile("noise/run_initial")
     def _initial_noise(
         self,
         *,
@@ -1782,7 +1857,9 @@ class MiniMaxH3Pipeline(
         audio_t: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         video_generator = torch.Generator(device="cpu").manual_seed(seed)
-        video = torch.randn(
+        video = _h3_call(
+            "noise/randn",
+            torch.randn,
             1,
             24,
             latent_t,
@@ -1791,12 +1868,16 @@ class MiniMaxH3Pipeline(
             generator=video_generator,
             dtype=torch.float32,
         )
-        video_rows = minimax_h3_patchify_video_latent(
+        video_rows = _h3_call(
+            "noise/patchify",
+            minimax_h3_patchify_video_latent,
             video,
             patch_size=(1, 2, 2),
         )
         audio_generator = torch.Generator(device="cpu").manual_seed(seed)
-        audio_rows = torch.randn(
+        audio_rows = _h3_call(
+            "noise/randn",
+            torch.randn,
             audio_t * 2,
             32,
             generator=audio_generator,
@@ -1845,13 +1926,17 @@ class MiniMaxH3Pipeline(
     def _resident_dit_layers_on_device(self, *, enabled: bool = True):
         controller = getattr(self, "_dlo_residency_controller", None)
         if controller is not None and enabled:
-            controller.load_resident_layers()
+            _h3_call(
+                "dit/residency_prepare",
+                controller.load_resident_layers,
+            )
         try:
             yield
         finally:
             if controller is not None and enabled:
                 controller.offload_resident_layers()
 
+    @_h3_profile("dit/build_inputs")
     def _build_denoise_inputs(
         self,
         *,
@@ -1908,12 +1993,16 @@ class MiniMaxH3Pipeline(
                 "MiniMax H3 res_multistep sampling with a fixed distilled sigma schedule has not been validated; "
                 "use sampler='euler' for this schedule."
             )
-        video_sigmas = minimax_h3_time_shift_sigmas(
+        video_sigmas = _h3_call(
+            "dit/sigmas",
+            minimax_h3_time_shift_sigmas,
             num_steps=num_steps,
             shift_scale=video_shift,
             base_schedule=base_schedule,
         )
-        audio_sigmas = minimax_h3_time_shift_sigmas(
+        audio_sigmas = _h3_call(
+            "dit/sigmas",
+            minimax_h3_time_shift_sigmas,
             num_steps=num_steps,
             shift_scale=audio_shift,
             base_schedule=base_schedule,
@@ -1956,7 +2045,9 @@ class MiniMaxH3Pipeline(
                     {"kind": "image", "latent_h": ref_h, "latent_w": ref_w},
                     {"kind": "audio", "ref_audio_t": ref_audio_t},
                 ]
-            packed = minimax_h3_packed_sequence_ref2va_blocks(
+            packed = _h3_call(
+                "dit/packed_layout",
+                minimax_h3_packed_sequence_ref2va_blocks,
                 text_len=int(text_embeddings.shape[0]),
                 latent_t=latent_t,
                 latent_h=latent_h,
@@ -1994,7 +2085,9 @@ class MiniMaxH3Pipeline(
 
         tags = packed["token_tags"].clone()
         tags[packed["text_pos"]] = text_tags.cpu()
-        branch = MiniMaxH3DenoiseBranch(
+        branch = _h3_call(
+            "dit/branch_init",
+            MiniMaxH3DenoiseBranch,
             packed=packed,
             text_embeddings=text_embeddings,
             token_tags=tags,
@@ -2008,7 +2101,9 @@ class MiniMaxH3Pipeline(
                 condition_shapes = [visual_condition_shape]
             if not condition_shapes:
                 raise ValueError("visual condition shape is missing")
-            visual_anchor = minimax_h3_imgvid_cond_noise_aug_rows(
+            visual_anchor = _h3_call(
+                "dit/condition_noise_aug",
+                minimax_h3_imgvid_cond_noise_aug_rows,
                 visual_anchor,
                 condition_shapes=condition_shapes,
                 target_latent_t=latent_t,
@@ -2018,7 +2113,9 @@ class MiniMaxH3Pipeline(
                 precomputed_noise_rows=precomputed_visual_condition_noise,
                 guided=bool(guide_blocks),
             )
-            full_video = torch.zeros(
+            full_video = _h3_call(
+                "dit/condition_allocate",
+                torch.zeros,
                 branch.img_pos.shape[0],
                 96,
                 dtype=torch.float32,
@@ -2047,7 +2144,9 @@ class MiniMaxH3Pipeline(
                 noise_aug=MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
                 guided=bool(guide_blocks),
             )
-            full_audio = torch.zeros(
+            full_audio = _h3_call(
+                "dit/condition_allocate",
+                torch.zeros,
                 branch.audio_pos.shape[0],
                 32,
                 dtype=torch.float32,
@@ -2242,7 +2341,7 @@ class MiniMaxH3Pipeline(
         cache_runtime = getattr(self, "_cache_dit_runtime", None)
         if cache_runtime is not None:
             cache_runtime.refresh(len(inputs["sigmas_video"]) - 1)
-        with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
+        with _h3_scope("dit/resident", self._resident_dit_layers_on_device(enabled=transformer is self.transformer)):
             with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     sampler=inputs["sampler"],
@@ -2606,6 +2705,7 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(str(exc)) from exc
         return videos
 
+    @_h3_profile("qwen/encode_prompt")
     def encode_prompt(self, prepared: PreparedEncoderInputs | None) -> tuple[torch.Tensor, torch.Tensor]:
         _, rank, _ = _dit_rank_world()
         ids = tags = hidden = None
@@ -2616,13 +2716,20 @@ class MiniMaxH3Pipeline(
                 if prepared is None:
                     raise ValueError("rank 0 must prepare MiniMax H3 text inputs")
                 if prepared.images:
-                    vision = self.processor.image_processor(images=prepared.images, return_tensors="pt")
+                    vision = _h3_call(
+                        "qwen/image_processor",
+                        self.processor.image_processor,
+                        images=prepared.images,
+                        return_tensors="pt",
+                    )
                     vision_kwargs.update(
                         pixel_values=vision["pixel_values"],
                         image_grid_thw=vision["image_grid_thw"],
                     )
                 if prepared.qwen_videos:
-                    vision = self.processor.video_processor(
+                    vision = _h3_call(
+                        "qwen/video_processor",
+                        self.processor.video_processor,
                         videos=[frames for frames, _ in prepared.qwen_videos],
                         do_sample_frames=False,
                         return_tensors="pt",
@@ -2631,7 +2738,9 @@ class MiniMaxH3Pipeline(
                         pixel_values_videos=vision["pixel_values_videos"],
                         video_grid_thw=vision["video_grid_thw"],
                     )
-                ids, tags = build_minimax_h3_presentation(
+                ids, tags = _h3_call(
+                    "qwen/presentation",
+                    build_minimax_h3_presentation,
                     self.tokenizer,
                     prompt=prepared.prompt,
                     task=prepared.media.task,
@@ -2643,15 +2752,16 @@ class MiniMaxH3Pipeline(
                 )
             except Exception as exc:
                 error = exc
-        _broadcast_rank0_exception(error)
+        _h3_call("prepare/error_exchange", _broadcast_rank0_exception, error)
         if rank < self.text_encoder_tp_size:
             ids = self._distribute_encode_inputs(ids, vision_kwargs)
             hidden = self._encode_text_hidden(ids, vision_kwargs)
         return (
-            _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device),
-            _broadcast_tensor(tags, dtype=torch.long, device=self.device),
+            _h3_call("qwen/result_broadcast", _broadcast_tensor, hidden, dtype=torch.bfloat16, device=self.device),
+            _h3_call("qwen/result_broadcast", _broadcast_tensor, tags, dtype=torch.long, device=self.device),
         )
 
+    @_h3_profile("vae/distribute_media")
     def _distribute_media_inputs(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaInput:
         group, rank, world_size = _dit_rank_world()
         if world_size == 1:
@@ -2659,19 +2769,31 @@ class MiniMaxH3Pipeline(
             return media
         tensors = media.to_mm_tensors() if media is not None else []
         header = [(media.to_metadata(), [value.dtype for value in tensors])] if media is not None else [None]
-        dist.broadcast_object_list(header, src=0, group=group)
+        _h3_call("vae/media_header", dist.broadcast_object_list, header, src=0, group=group)
         metadata, dtypes = header[0]
         received = []
         for index, dtype in enumerate(dtypes):
-            value = _broadcast_tensor(tensors[index] if rank == 0 else None, dtype=dtype, device=self.device)
+            value = _h3_call(
+                "vae/media_payload",
+                _broadcast_tensor,
+                tensors[index] if rank == 0 else None,
+                dtype=dtype,
+                device=self.device,
+            )
             if rank != 0:
-                received.append(value.cpu())
+                received.append(
+                    _h3_call(
+                        "vae/media_receive_cpu",
+                        value.cpu,
+                    )
+                )
             del value
         if rank == 0:
             assert media is not None
             return media
         return MiniMaxH3EncoderMediaInput.from_mm_tensors(received, metadata)
 
+    @_h3_profile("vae/conditioning_broadcast")
     def _broadcast_media_conditioning(
         self, conditioning: MiniMaxH3EncoderMediaConditioning | None
     ) -> MiniMaxH3EncoderMediaConditioning:
@@ -2702,14 +2824,25 @@ class MiniMaxH3Pipeline(
                 for name in tensor_names
             }
             header[0] = (metadata, dtypes)
-        dist.broadcast_object_list(header, src=0, group=group)
+        _h3_call("vae/condition_header", dist.broadcast_object_list, header, src=0, group=group)
         metadata, dtypes = header[0]
         tensors = {}
         for name, dtype in dtypes.items():
             source = getattr(conditioning, name) if rank == 0 else None
-            tensors[name] = _broadcast_tensor(source, dtype=dtype, device=self.device) if dtype is not None else None
+            tensors[name] = (
+                _h3_call(
+                    "vae/condition_payload",
+                    _broadcast_tensor,
+                    source,
+                    dtype=dtype,
+                    device=self.device,
+                )
+                if dtype is not None
+                else None
+            )
         return MiniMaxH3EncoderMediaConditioning(**metadata, **tensors)
 
+    @_h3_profile("vae/local_media")
     def _encode_local_media(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaConditioning:
         group, rank, world_size = _dit_rank_world()
         distributed_video = self.video_vae.is_distributed_enabled()
@@ -2735,7 +2868,7 @@ class MiniMaxH3Pipeline(
             # All participants finish the codec phase before any latent broadcast.
             errors = [None] * world_size
             info = (str(error), isinstance(error, OmniClientError)) if error is not None else None
-            dist.all_gather_object(errors, info, group=group)
+            _h3_call("vae/error_gather", dist.all_gather_object, errors, info, group=group)
             for info in errors:
                 if info is not None:
                     if error is not None:
@@ -2756,6 +2889,7 @@ class MiniMaxH3Pipeline(
             shapes.append(self.video_vae.predict_video_latent_shape(frames))
         return tuple(shapes)
 
+    @_h3_profile("prepare/local_conditioning")
     def _prepare_local_conditioning(
         self,
         raw_prompt: Any,
@@ -2771,6 +2905,13 @@ class MiniMaxH3Pipeline(
         """
         group, rank, world_size = _dit_rank_world()
         prompts = (sampling.extra_args or {}).get("continuation_prompts")
+        _h3_annotate(
+            dit_world_size=world_size,
+            dit_group_ranks=list(range(world_size)),
+            noise_mode="main_background_precompute",
+            seed=sampling.seed,
+            num_inference_steps=sampling.num_inference_steps,
+        )
         prepared = text_conditioning = None
         initial_noise_params = None
         visual_noise_params = None
@@ -2859,10 +3000,10 @@ class MiniMaxH3Pipeline(
                         }
             except Exception as exc:
                 error = exc
-        _broadcast_rank0_exception(error)
+        _h3_call("prepare/error_exchange", _broadcast_rank0_exception, error)
         header = [(text_conditioning is not None, initial_noise_params, visual_noise_params)]
         if world_size > 1:
-            dist.broadcast_object_list(header, src=0, group=group)
+            _h3_call("prepare/header_exchange", dist.broadcast_object_list, header, src=0, group=group)
         reuse_text, initial_noise_params, visual_noise_params = header[0]
         executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="minimax_h3_initial_noise")
@@ -2872,12 +3013,14 @@ class MiniMaxH3Pipeline(
         # Independent CPU generators preserve sampling; join the worker on request exit.
         try:
             initial_noise = (
-                executor.submit(self._initial_noise, **initial_noise_params)
+                _h3_submit("noise/background_initial", executor, self._initial_noise, **initial_noise_params)
                 if initial_noise_params is not None
                 else None
             )
             visual_noise = (
-                executor.submit(minimax_h3_imgvid_cond_noise_rows, **visual_noise_params)
+                _h3_submit(
+                    "noise/background_visual", executor, minimax_h3_imgvid_cond_noise_rows, **visual_noise_params
+                )
                 if visual_noise_params is not None
                 else None
             )
@@ -2901,7 +3044,7 @@ class MiniMaxH3Pipeline(
             media = self._encode_local_media(prepared.media if prepared is not None else None)
             if initial_noise is not None:
                 assert request_context is not None
-                request_context["precomputed_initial_noise"] = initial_noise.result()
+                request_context["precomputed_initial_noise"] = _h3_call("noise/initial_join", initial_noise.result)
             if visual_noise is not None:
                 assert request_context is not None
                 assert visual_noise_params is not None
@@ -2912,7 +3055,9 @@ class MiniMaxH3Pipeline(
                         "MiniMax H3 predicted visual condition shapes do not match encoded shapes: "
                         f"predicted {predicted_shapes}, encoded {actual_shapes}"
                     )
-                request_context["precomputed_visual_condition_noise"] = visual_noise.result()
+                request_context["precomputed_visual_condition_noise"] = _h3_call(
+                    "noise/visual_join", visual_noise.result
+                )
             return MiniMaxH3EncoderConditioning.from_components(
                 MiniMaxH3TextConditioning(hidden, tags), media
             ), window_text
@@ -2920,6 +3065,7 @@ class MiniMaxH3Pipeline(
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=True)
 
+    @_h3_profile("prepare/request_inputs")
     def _prepare_request_inputs(self, raw_prompt: Any, sampling: Any) -> dict[str, Any]:
         if (getattr(sampling, "extra_args", None) or {}).get(
             "continuation_prompts"
@@ -2967,6 +3113,7 @@ class MiniMaxH3Pipeline(
         except ValueError as exc:
             raise OmniClientError(str(exc)) from exc
 
+    @_h3_profile("prepare/conditioning_context")
     def _prepare_encoder_conditioning_inputs(
         self,
         conditioning: MiniMaxH3EncoderConditioning,
@@ -3307,6 +3454,7 @@ class MiniMaxH3Pipeline(
         }
 
     @torch.no_grad()
+    @_h3_profile("pipeline/forward")
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
         if len(request.prompts) != 1:
             raise OmniClientError("MiniMax H3 supports one request at a time")

@@ -31,6 +31,7 @@ complete ``[seq, 5120]`` hidden state.
 from __future__ import annotations
 
 import itertools
+import os
 import re
 from collections.abc import Iterable
 from pathlib import Path
@@ -47,6 +48,12 @@ from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
 from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
+)
+from vllm_omni.profiler.h3_p0 import (
+    call as _h3_call,
+)
+from vllm_omni.profiler.h3_p0 import (
+    profile as _h3_profile,
 )
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
@@ -605,14 +612,20 @@ class MiniMaxH3Qwen3VLVisionBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        sequence_parallel: Any = None,
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
-            cu_seqlens=cu_seqlens,
-            position_embeddings=position_embeddings,
-        )
+        normalized = self.norm1(hidden_states)
+        if sequence_parallel is None:
+            output = self.attn(normalized, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+        else:
+            from .vision_sp import attention_sp8
+
+            output = attention_sp8(
+                self.attn, normalized, position_embeddings, sequence_parallel, _apply_rotary_pos_emb_vision
+            )
+        hidden_states = hidden_states + output
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
 
@@ -729,6 +742,11 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
         hidden_states: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        group = getattr(self, "sequence_parallel_group", None)
+        if group is not None:
+            from .vision_sp import forward_sp8
+
+            return forward_sp8(self, hidden_states, grid_thw, group=group)
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds
@@ -1021,6 +1039,7 @@ def _get_vision_position_ids(
     return torch.stack([position_temporal, position_height, position_width], dim=0)
 
 
+@_h3_profile("qwen/mrope_index")
 def _get_rope_index(
     input_ids: torch.Tensor,
     mm_token_type_ids: torch.Tensor,
@@ -1139,6 +1158,11 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         _validate_encoder_quant_config(quant_config)
         dtype = torch.bfloat16
         self.vision = MiniMaxH3Qwen3VLVisionModel(config.vision_config)
+        from .vision_parallel import resolve_vision_sp_group
+
+        self.vision.sequence_parallel_group = resolve_vision_sp_group(
+            os.environ.get("VLLM_OMNI_H3_VISION_SP_SIZE", "0"), encoder_group
+        )
         self.vision.to(dtype=dtype)
         self.text_model = MiniMaxH3Qwen3VLTextModel(
             encoder_group,
@@ -1150,9 +1174,10 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         if not isinstance(quant_config, FastH3NVFP4Config):
             self.text_model.to(dtype=dtype)
         logger.info(
-            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision replicated",
+            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision_sp=%s",
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
             self._tp_size,
+            os.environ.get("VLLM_OMNI_H3_VISION_SP_SIZE", "0"),
         )
 
     @property
@@ -1244,6 +1269,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             raise RuntimeError(f"MiniMax H3 text encoder weights not loaded: {len(missing)} params: {missing}")
         return loaded
 
+    @_h3_profile("qwen/load_component")
     def load_to_device(self) -> None:
         if not self.is_loaded:
             return
@@ -1264,6 +1290,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         self.vision.to(self.device_target)
         self.text_model.to(self.device_target)
 
+    @_h3_profile("qwen/offload_component")
     def offload_to_cpu(self) -> None:
         if not self.is_loaded:
             return
@@ -1319,28 +1346,32 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         mm_types[ids == self.image_token_id] = 1
         mm_types[ids == self.video_token_id] = 2
 
-        inputs_embeds = self.text_model.embed_tokens(ids)
+        inputs_embeds = _h3_call("qwen/embed_tokens", self.text_model.embed_tokens, ids)
         image_mask = None
         video_mask = None
         deepstack_image_embeds: list[torch.Tensor] | None = None
         deepstack_video_embeds: list[torch.Tensor] | None = None
 
         if pixel_values is not None:
-            image_embeds, deepstack_image_embeds = self.vision(
-                pixel_values.to(device, torch.bfloat16),
+            image_embeds, deepstack_image_embeds = _h3_call(
+                "qwen/vision",
+                self.vision,
+                _h3_call("qwen/vision_input_to", pixel_values.to, device, torch.bfloat16),
                 image_grid_thw.to(device, torch.long),
             )
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _ = self._get_placeholder_mask(ids, inputs_embeds=inputs_embeds, image_features=image_embeds)
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            inputs_embeds = _h3_call("qwen/visual_scatter", inputs_embeds.masked_scatter, image_mask, image_embeds)
         if pixel_values_videos is not None:
-            video_embeds, deepstack_video_embeds = self.vision(
-                pixel_values_videos.to(device, torch.bfloat16),
+            video_embeds, deepstack_video_embeds = _h3_call(
+                "qwen/vision",
+                self.vision,
+                _h3_call("qwen/vision_video_input_to", pixel_values_videos.to, device, torch.bfloat16),
                 video_grid_thw.to(device, torch.long),
             )
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask = self._get_placeholder_mask(ids, inputs_embeds=inputs_embeds, video_features=video_embeds)
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+            inputs_embeds = _h3_call("qwen/visual_scatter", inputs_embeds.masked_scatter, video_mask, video_embeds)
 
         visual_pos_masks, deepstack_visual_embeds = self._aggregate_deepstack(
             image_mask,
@@ -1357,7 +1388,9 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             attention_mask=attention_mask,
             spatial_merge_size=int(self.vision.config.spatial_merge_size),
         )
-        hidden = self.text_model(
+        hidden = _h3_call(
+            "qwen/text",
+            self.text_model,
             inputs_embeds,
             positions,
             visual_pos_masks=visual_pos_masks,
@@ -1368,6 +1401,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             raise ValueError(f"unexpected Qwen3-VL hidden shape {tuple(hidden.shape)}, expected {expected}")
         return hidden.to(torch.bfloat16)
 
+    @_h3_profile("qwen/placeholder_check")
     def _get_placeholder_mask(
         self,
         input_ids: torch.Tensor,
@@ -1394,6 +1428,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             )
         return special_image_mask, special_video_mask
 
+    @_h3_profile("qwen/deepstack_aggregate")
     def _aggregate_deepstack(
         self,
         image_mask: torch.Tensor | None,
@@ -1423,6 +1458,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         return None, None
 
     @torch.inference_mode()
+    @_h3_profile("qwen/encode_ids")
     def encode_ids(
         self,
         input_ids: torch.Tensor,
@@ -1453,7 +1489,10 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 pixel_values_videos=pixel_values_videos,
                 video_grid_thw=video_grid_thw,
             )
-            return hidden.cpu()
+            return _h3_call(
+                "qwen/hidden_to_cpu",
+                hidden.cpu,
+            )
         finally:
             torch.backends.cuda.enable_cudnn_sdp(cudnn_sdp_enabled)
 

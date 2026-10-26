@@ -58,6 +58,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     UrlVideoReference,
     VideoReference,
 )
+from vllm_omni.profiler.h3_p0 import profile as _h3_profile
 
 if TYPE_CHECKING:
     import av
@@ -119,6 +120,7 @@ def positive_float(value: Any) -> float | None:
     return result
 
 
+@_h3_profile("api/ref_decode_bytes")
 def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
     try:
         with Image.open(BytesIO(image_bytes)) as image:
@@ -216,6 +218,7 @@ def _decode_media_bytes(
             ) from video_exc
 
 
+@_h3_profile("api/ref_base64")
 def _decode_base64_image(input_reference: str, *, source: str) -> Image.Image:
     if input_reference:
         if input_reference.startswith("data:image"):
@@ -231,6 +234,7 @@ def _decode_base64_image(input_reference: str, *, source: str) -> Image.Image:
     raise InvalidInputReferenceError(f"Invalid {source}: image data is empty.")
 
 
+@_h3_profile("api/ref_url")
 async def decode_image_url(image_url: str) -> Image.Image:
     if image_url.startswith("data:image"):
         return _decode_base64_image(image_url, source="image_reference.image_url")
@@ -391,6 +395,7 @@ async def decode_audio_url(audio_url: str) -> str:
     return tmp.name
 
 
+@_h3_profile("api/ref_resolve")
 async def decode_input_reference(
     image_reference: ImageReference | None,
     video_reference: VideoReference | None,

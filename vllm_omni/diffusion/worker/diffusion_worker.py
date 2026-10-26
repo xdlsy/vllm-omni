@@ -89,6 +89,9 @@ from vllm_omni.inputs.data import OmniInteractionPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
+from vllm_omni.profiler.h3_p0 import (
+    request as _h3_request,
+)
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
 if TYPE_CHECKING:
@@ -830,7 +833,17 @@ class DiffusionWorker:
                 logger.warning("LoRA activation skipped: %s", exc)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
-        with ctx:
+        with (
+            _h3_request(
+                req.request_id,
+                global_rank=self.rank,
+                local_rank=self.local_rank,
+                device_id=str(self.device),
+                model=str(od_config.model),
+                pipeline_profiler_sync=od_config.enable_diffusion_pipeline_profiler,
+            ),
+            ctx,
+        ):
             kwargs: dict[str, Any] = {"kv_prefetch_job": kv_prefetch_job}
             if diffusion_kv_metadata is not None:
                 kwargs["diffusion_kv_metadata"] = diffusion_kv_metadata
