@@ -32,6 +32,21 @@ from vllm_omni.diffusion.offloader.module_residency import (
     PinnedModuleStager,
 )
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.profiler.h3_p0 import (
+    call as _h3_call,
+)
+from vllm_omni.profiler.h3_p0 import (
+    event as _h3_event,
+)
+from vllm_omni.profiler.h3_p0 import (
+    profile as _h3_profile,
+)
+from vllm_omni.profiler.h3_p0 import (
+    scope as _h3_scope,
+)
+from vllm_omni.profiler.h3_p0 import (
+    stage as _h3_stage,
+)
 
 from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
@@ -438,6 +453,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             return self._decoder_stager
         raise ValueError(f"unknown video VAE part {part!r}")
 
+    @_h3_profile("vae/load_part")
     def _load_part_to_device(self, part: str) -> None:
         stager = self._part_stager(part)
         if stager is not None:
@@ -449,6 +465,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             # or is fully CPU-resident): fall back to whole-module placement.
             self.remote.to(self._device_target)
 
+    @_h3_profile("vae/offload_part")
     def _offload_part_to_cpu(self, part: str) -> None:
         stager = self._part_stager(part)
         if stager is not None:
@@ -705,6 +722,14 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         if parallel_size <= 1:
             return nullcontext()
         num_tiles = self._encoder_tile_count(height, width)
+        _h3_event(
+            "vae/tiling_policy",
+            height=height,
+            width=width,
+            num_tiles=num_tiles,
+            parallel_size=parallel_size,
+            rank_local_fallback=num_tiles < parallel_size,
+        )
         if num_tiles >= parallel_size:
             return nullcontext()
         logger.warning_once(
@@ -747,6 +772,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         return self.parallel_size > 1 and dist.is_initialized()
 
     @torch.inference_mode()
+    @_h3_profile("vae/image_encode")
     def encode_image(self, image: Image.Image) -> torch.Tensor:
         if getattr(self, "decode_only", False):
             raise RuntimeError("MiniMax H3 decode-only video VAE cannot encode images")
@@ -755,15 +781,26 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self.model.parallel_tiling = False
         parameter = next(self.parameters())
         previous_dtype = parameter.dtype
+        _h3_event(
+            "vae/encode_policy",
+            compute_dtype="torch.float32",
+            previous_dtype=str(previous_dtype),
+            parallel_size=self.parallel_size,
+            native_class=type(self.model).__qualname__,
+            native_module=type(self.model).__module__,
+        )
         if previous_dtype != torch.float32:
-            self.to(torch.float32)
+            _h3_call("vae/image_dtype", self.to, torch.float32)
         devices = [parameter.device] if parameter.device.type != "cpu" else []
         try:
             with (
                 self._encoder_tiling_context(image.height, image.width),
-                torch.random.fork_rng(
-                    devices=devices,
-                    device_type=parameter.device.type,
+                _h3_scope(
+                    "vae/rng",
+                    torch.random.fork_rng(
+                        devices=devices,
+                        device_type=parameter.device.type,
+                    ),
                 ),
             ):
                 torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
@@ -771,20 +808,23 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                     with self.device_module.device(device):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 with _minimax_h3_keyframe_encode_context(parameter.device):
-                    latent = self.model.encode_images(
+                    latent = _h3_call(
+                        "vae/image_native_encode",
+                        self.model.encode_images,
                         image,
                         use_fp16_latent=True,
                     )[0]
         finally:
             self.model.parallel_tiling = previous_parallel
             if previous_dtype != torch.float32:
-                self.to(previous_dtype)
+                _h3_call("vae/image_dtype", self.to, previous_dtype)
 
         # Match the reference contract exactly: normalization and patchify
         # happen on CPU in FP32 after the sampled encode. The condition noise
         # path is sensitive enough that doing these elementwise operations on
         # CUDA can noticeably change the final conditioned video.
-        latent = latent.float().cpu()
+        latent = _h3_call("vae/latent_float", latent.float)
+        latent = _h3_call("vae/latent_return", latent.cpu)
         if latent.ndim == 4:
             latent = latent[None]
         channels = int(self.config_dict["latent_channels"])
@@ -794,11 +834,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         std = torch.tensor(
             self.config_dict["latents_std"],
         ).view(1, channels, 1, 1, 1)
-        return minimax_h3_patchify_video_latent(
-            (latent - mean) / std,
+        with _h3_stage("vae/normalize"):
+            normalized = (latent - mean) / std
+        return _h3_call(
+            "vae/patchify",
+            minimax_h3_patchify_video_latent,
+            normalized,
             patch_size=(1, 2, 2),
         ).float()
 
+    @_h3_profile("vae/video_prepare_metadata")
     def _stream_video_prep_metadata(
         self,
         frames: np.ndarray,
@@ -860,6 +905,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         ratio = int(self.model.vae_ratio)
         return latent_t, int(height // ratio), int(width // ratio)
 
+    @_h3_profile("vae/video_prepare_tensor")
     def _stream_prepare_video_tensor(
         self,
         frames: np.ndarray,
@@ -911,6 +957,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         return out
 
     @torch.inference_mode()
+    @_h3_profile("vae/video_encode")
     def encode_video(
         self,
         frames: Any,
@@ -919,8 +966,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             raise RuntimeError("MiniMax H3 decode-only video VAE cannot encode videos")
         parameter = next(self.parameters())
         previous_dtype = parameter.dtype
+        _h3_event(
+            "vae/encode_policy",
+            compute_dtype="torch.float32",
+            previous_dtype=str(previous_dtype),
+            parallel_size=self.parallel_size,
+            native_class=type(self.model).__qualname__,
+            native_module=type(self.model).__module__,
+        )
         if previous_dtype != torch.float32:
-            self.to(torch.float32)
+            _h3_call("vae/video_dtype", self.to, torch.float32)
         devices = [parameter.device] if parameter.device.type != "cpu" else []
         shape = getattr(frames, "shape", None)
         if int(getattr(self, "parallel_size", 1)) > 1:
@@ -934,7 +989,13 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         else:
             tiling_context = nullcontext()
         try:
-            with tiling_context, torch.random.fork_rng(devices=devices, device_type=parameter.device.type):
+            with (
+                tiling_context,
+                _h3_scope(
+                    "vae/rng",
+                    torch.random.fork_rng(devices=devices, device_type=parameter.device.type),
+                ),
+            ):
                 torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 for device in devices:
                     with self.device_module.device(device):
@@ -947,15 +1008,18 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                     # (3, T, H, W) normalized-FP32 contract, so encode_videos
                     # skips its own convert/transform/pad whole-video copies.
                     frames = [prepared]
-                latent = self.model.encode_videos(
+                latent = _h3_call(
+                    "vae/video_native_encode",
+                    self.model.encode_videos,
                     frames,
                     use_fp16_latent=True,
                 )[0]
         finally:
             if previous_dtype != torch.float32:
-                self.to(previous_dtype)
+                _h3_call("vae/video_dtype", self.to, previous_dtype)
 
-        latent = latent.float().cpu()
+        latent = _h3_call("vae/video_latent_float", latent.float)
+        latent = _h3_call("vae/video_latent_return", latent.cpu)
         if latent.ndim == 4:
             latent = latent[None]
         channels = int(self.config_dict["latent_channels"])
@@ -972,8 +1036,12 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         std = torch.tensor(
             self.config_dict["latents_std"],
         ).view(1, channels, 1, 1, 1)
-        rows = minimax_h3_patchify_video_latent(
-            (latent - mean) / std,
+        with _h3_stage("vae/video_normalize"):
+            normalized = (latent - mean) / std
+        rows = _h3_call(
+            "vae/video_patchify",
+            minimax_h3_patchify_video_latent,
+            normalized,
             patch_size=(1, 2, 2),
         ).float()
         return rows, shape

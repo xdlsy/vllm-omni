@@ -14,6 +14,13 @@ from collections.abc import Sequence
 
 import torch
 
+from vllm_omni.profiler.h3_p0 import (
+    call as _h3_call,
+)
+from vllm_omni.profiler.h3_p0 import (
+    profile as _h3_profile,
+)
+
 from .packed_tokens import minimax_h3_patchify_video_latent
 
 # Channel-major packed audio rows always carry a stereo layout.
@@ -55,7 +62,9 @@ def _draw_imgvid_condition_noise_rows(
 ) -> torch.Tensor:
     full_t = max(target_latent_t + imgvid_cond_num_frames, latent_t)
     generator = torch.Generator(device="cpu").manual_seed(int(seed))
-    noise = torch.randn(
+    noise = _h3_call(
+        "noise/condition_randn",
+        torch.randn,
         1,
         24,
         full_t,
@@ -68,6 +77,7 @@ def _draw_imgvid_condition_noise_rows(
     return minimax_h3_patchify_video_latent(noise, patch_size=[1, 2, 2])
 
 
+@_h3_profile("noise/condition_rows")
 def minimax_h3_imgvid_cond_noise_rows(
     *,
     condition_shapes: Sequence[Sequence[int]],
@@ -100,6 +110,7 @@ def minimax_h3_imgvid_cond_noise_rows(
     return noise_parts[0] if len(noise_parts) == 1 else torch.cat(noise_parts, dim=0)
 
 
+@_h3_profile("noise/condition_aug")
 def minimax_h3_imgvid_cond_noise_aug_rows(
     clean_rows: torch.Tensor,
     *,
@@ -174,7 +185,9 @@ def minimax_h3_imgvid_cond_noise_aug_rows(
         row_count = latent_t * (latent_h // 2) * (latent_w // 2)
         if guided:
             generator = torch.Generator(device="cpu").manual_seed(int(seed))
-            noise_rows = torch.randn(
+            noise_rows = _h3_call(
+                "noise/condition_randn",
+                torch.randn,
                 (row_count, 96),
                 generator=generator,
                 dtype=torch.float32,
@@ -258,7 +271,9 @@ def minimax_h3_audio_cond_noise_aug_rows(
         row_count = audio_channels * audio_t
         clean_part = clean_rows[row_offset : row_offset + row_count].detach().to(device="cpu", dtype=torch.float32)
         generator = torch.Generator(device="cpu").manual_seed(int(seed) + 1)
-        noise = torch.randn(
+        noise = _h3_call(
+            "noise/condition_randn",
+            torch.randn,
             clean_part.shape,
             generator=generator,
             dtype=torch.float32,

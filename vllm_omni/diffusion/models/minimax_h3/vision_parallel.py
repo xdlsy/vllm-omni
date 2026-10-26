@@ -49,6 +49,19 @@ def build_vision_plan(lengths, sp_size, *, num_heads=16, merge_size=2):
     return VisionShardPlan(lengths, tuple(map(tuple, tokens)), tuple(map(tuple, mergers)), num_heads // sp_size)
 
 
+def validate_stage_layout(world_size, vision_ranks, downstream_ranks, sp_size, num_heads, *, data_parallel_size=1):
+    """Validate a proposed layout, not the current serving runtime's support."""
+    build_vision_plan((), sp_size, num_heads=num_heads)
+    if world_size < sp_size or any(r < 0 or r >= world_size for r in (*vision_ranks, *downstream_ranks)):
+        raise ValueError("vision/downstream rank is outside the world")
+    if data_parallel_size != 1:
+        raise ValueError("implicit DP replication is not the independent vision stage")
+    if tuple(downstream_ranks) != tuple(range(8)):
+        raise ValueError("the frozen downstream stage must use ranks 0..7")
+    if len(set(vision_ranks)) != sp_size or len(vision_ranks) != sp_size:
+        raise ValueError("vision participants must be distinct and match SP")
+
+
 def pack_heads(local, size, capacity):
     count, heads, dim = local.shape
     if heads % size or count > capacity:
