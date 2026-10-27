@@ -568,6 +568,8 @@ class MiniMaxH3Qwen3VLVisionAttention(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        *,
+        sequence_lengths: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
         query_states, key_states, value_states = (
@@ -580,8 +582,15 @@ class MiniMaxH3Qwen3VLVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
+        if sequence_lengths is None:
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            splits = [
+                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
+            ]
+        else:
+            splits = [
+                torch.split(tensor, sequence_lengths, dim=2) for tensor in (query_states, key_states, value_states)
+            ]
         attn_outputs = [
             F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False) for q, k, v in zip(*splits)
         ]
@@ -608,12 +617,20 @@ class MiniMaxH3Qwen3VLVisionBlock(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        *,
+        sequence_lengths: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
-            cu_seqlens=cu_seqlens,
-            position_embeddings=position_embeddings,
-        )
+        normalized = self.norm1(hidden_states)
+        if sequence_lengths is None:
+            output = self.attn(normalized, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+        else:
+            output = self.attn(
+                normalized,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                sequence_lengths=sequence_lengths,
+            )
+        hidden_states = hidden_states + output
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
 
@@ -765,13 +782,25 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
             dim=0, dtype=torch.int32
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        sequence_lengths = None
+        if os.environ.get("VLLM_OMNI_H3_VISION_LENGTHS", "0") == "1":
+            # Read the original integer boundaries once, without caching requests.
+            sequence_lengths = tuple((cu_seqlens[1:] - cu_seqlens[:-1]).tolist())
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
-            hidden_states = blk(
-                hidden_states,
-                cu_seqlens=cu_seqlens,
-                position_embeddings=position_embeddings,
-            )
+            if sequence_lengths is None:
+                hidden_states = blk(
+                    hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    position_embeddings=position_embeddings,
+                )
+            else:
+                hidden_states = blk(
+                    hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    position_embeddings=position_embeddings,
+                    sequence_lengths=sequence_lengths,
+                )
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](
                     hidden_states

@@ -27,3 +27,17 @@ and each reference's temporal repetition are preserved. The cache is local to
 the call, so configuration, dtype, weights, and grids cannot become stale across
 requests. It stores geometry metadata rather than embedding outputs or
 activations. This switch works independently of tensor position metadata.
+
+## Share sequence lengths across blocks
+
+`VLLM_OMNI_H3_VISION_LENGTHS=1` converts the existing cumulative sequence
+boundaries into a host tuple once per vision forward. Every original block and
+its Q/K/V splits share that tuple, reducing 81 length reads to one in a 27-block
+tower. It preserves the original integer-boundary computation and the same
+per-segment SDPA calls. The original module calls and offloader hooks remain in
+place; only opt-in calls carry the new optional `sequence_lengths` keyword.
+
+The tuple is not retained across requests. The default path continues reading
+the original device boundaries in each attention call. Removing the reads does
+not imply that the whole Attention startup gap disappears; end-to-end vision
+timing must include the single preparation read before the block loop.

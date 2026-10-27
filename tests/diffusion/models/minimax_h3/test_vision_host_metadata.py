@@ -12,6 +12,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 POS_TENSOR = "VLLM_OMNI_H3_VISION_POS_TENSOR"
 POS_REUSE = "VLLM_OMNI_H3_VISION_POS_REUSE"
+LENGTHS = "VLLM_OMNI_H3_VISION_LENGTHS"
+
+
+@pytest.fixture(autouse=True)
+def disable_metadata_candidates(monkeypatch):
+    for key in (POS_TENSOR, POS_REUSE, LENGTHS):
+        monkeypatch.delenv(key, raising=False)
 
 
 def make_model(dtype=torch.float32, depth=3):
@@ -141,3 +148,82 @@ def test_reused_position_metadata_is_request_local(monkeypatch, tensor_path):
         model.fast_pos_embed_interpolate(torch.tensor([[1, 4, 6], [1, 6, 8]]))
         model.fast_pos_embed_interpolate(torch.tensor([[1, 4, 6], [2, 4, 6]]))
     assert len(calls) == 8
+
+
+def make_pixels(model, grid):
+    count = sum(t * h * w for t, h, w in grid.tolist())
+    width = model.config.in_channels * model.config.temporal_patch_size * model.config.patch_size**2
+    generator = torch.Generator().manual_seed(123)
+    return torch.randn(count, width, generator=generator).to(model.pos_embed.weight.dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("combined", [False, True])
+@pytest.mark.parametrize("rows", [[[1, 4, 6]], [[1, 4, 6], [1, 6, 8]], [[2, 4, 6], [1, 6, 8]]])
+def test_shared_lengths_preserve_full_vision_and_deepstack(monkeypatch, dtype, combined, rows):
+    model = make_model(dtype)
+    grid = torch.tensor(rows)
+    pixels = make_pixels(model, grid)
+    with torch.inference_mode():
+        expected = model(pixels, grid)
+        monkeypatch.setenv(LENGTHS, "1")
+        if combined:
+            monkeypatch.setenv(POS_TENSOR, "1")
+            monkeypatch.setenv(POS_REUSE, "1")
+        actual = model(pixels, grid)
+    assert_bytes(actual[0], expected[0])
+    assert len(actual[1]) == len(expected[1])
+    for a, b in zip(actual[1], expected[1]):
+        assert_bytes(a, b)
+
+
+@pytest.mark.parametrize("depth", [3, 27])
+@pytest.mark.parametrize("enabled", [None, "0", "1"])
+def test_shared_lengths_read_once_for_all_layers_and_keep_hooks(monkeypatch, depth, enabled):
+    model = make_model(depth=depth)
+    grid = torch.tensor([[2, 4, 6], [1, 6, 8]])
+    pixels = make_pixels(model, grid)
+    if enabled is not None:
+        monkeypatch.setenv(LENGTHS, enabled)
+    original = torch.Tensor.tolist
+    reads = []
+    seen = []
+
+    def tracked(tensor):
+        if tensor.dtype == torch.int32 and tuple(tensor.shape) == (3,):
+            reads.append(True)
+        return original(tensor)
+
+    def observe(module, args, kwargs):
+        seen.append(kwargs.get("sequence_lengths"))
+
+    handles = [block.register_forward_pre_hook(observe, with_kwargs=True) for block in model.blocks]
+    monkeypatch.setattr(torch.Tensor, "tolist", tracked)
+    try:
+        with torch.inference_mode():
+            model(pixels, grid)
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert len(reads) == (1 if enabled == "1" else depth * 3)
+    assert len(seen) == depth
+    if enabled == "1":
+        assert all(value is seen[0] for value in seen)
+        assert seen[0] == (24, 24, 48)
+    else:
+        assert all(value is None for value in seen)
+
+
+def test_shared_lengths_are_rebuilt_for_different_requests(monkeypatch):
+    model = make_model()
+    for rows in ([[1, 4, 6]], [[2, 8, 4], [1, 6, 8]], [[1, 4, 6]]):
+        grid = torch.tensor(rows)
+        pixels = make_pixels(model, grid)
+        with torch.inference_mode():
+            monkeypatch.setenv(LENGTHS, "0")
+            expected = model(pixels, grid)
+            monkeypatch.setenv(LENGTHS, "1")
+            actual = model(pixels, grid)
+        assert_bytes(actual[0], expected[0])
+        for a, b in zip(actual[1], expected[1]):
+            assert_bytes(a, b)
