@@ -31,6 +31,7 @@ complete ``[seq, 5120]`` hidden state.
 from __future__ import annotations
 
 import itertools
+import os
 import re
 from collections.abc import Iterable
 from pathlib import Path
@@ -675,6 +676,7 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
 
     def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
         grid_thw_list = grid_thw.tolist()
+        tensor_metadata = os.environ.get("VLLM_OMNI_H3_VISION_POS_TENSOR", "0") == "1"
         grid_ts = [row[0] for row in grid_thw_list]
         grid_hs = [row[1] for row in grid_thw_list]
         grid_ws = [row[2] for row in grid_thw_list]
@@ -705,10 +707,23 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
                 (dh[None].T * dw[None]).flatten(),
             ]
             for i in range(4):
-                idx_list[i].extend(indices[i].tolist())
-                weight_list[i].extend(weights[i].tolist())
-        idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
-        weight_tensor = torch.tensor(weight_list, dtype=self.pos_embed.weight.dtype, device=device)
+                if tensor_metadata:
+                    idx_list[i].append(indices[i])
+                    weight_list[i].append(weights[i])
+                else:
+                    idx_list[i].extend(indices[i].tolist())
+                    weight_list[i].extend(weights[i].tolist())
+        if tensor_metadata:
+            # Preserve CPU conversion/rounding before transfer, as in tensor(list).
+            idx_cpu = torch.stack([torch.cat(parts) for parts in idx_list]).to(dtype=torch.long, device="cpu")
+            weight_cpu = torch.stack([torch.cat(parts) for parts in weight_list]).to(
+                dtype=self.pos_embed.weight.dtype, device="cpu"
+            )
+            idx_tensor = idx_cpu.to(device=device)
+            weight_tensor = weight_cpu.to(device=device)
+        else:
+            idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
+            weight_tensor = torch.tensor(weight_list, dtype=self.pos_embed.weight.dtype, device=device)
         pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
         patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
