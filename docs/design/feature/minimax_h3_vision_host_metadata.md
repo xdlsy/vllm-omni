@@ -17,3 +17,13 @@ merger ordering, and temporal repetition remain unchanged.
 
 The switch is checked per forward. No request activations or metadata are
 retained across requests. The original list-based path remains the default.
+
+## Reuse matching position grids
+
+`VLLM_OMNI_H3_VISION_POS_REUSE=1` computes interpolation indices and weights
+once per distinct `(height, width)` in a vision forward. References with the
+same spatial grid reuse those CPU tensors, while the original reference order
+and each reference's temporal repetition are preserved. The cache is local to
+the call, so configuration, dtype, weights, and grids cannot become stale across
+requests. It stores geometry metadata rather than embedding outputs or
+activations. This switch works independently of tensor position metadata.

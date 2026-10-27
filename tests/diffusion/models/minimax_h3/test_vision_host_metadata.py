@@ -11,6 +11,7 @@ from vllm_omni.diffusion.models.minimax_h3 import encoder as encoder_module
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 POS_TENSOR = "VLLM_OMNI_H3_VISION_POS_TENSOR"
+POS_REUSE = "VLLM_OMNI_H3_VISION_POS_REUSE"
 
 
 def make_model(dtype=torch.float32, depth=3):
@@ -82,3 +83,61 @@ def test_tensor_position_metadata_does_not_retain_previous_grid(monkeypatch):
             monkeypatch.setenv(POS_TENSOR, "1")
             actual = model.fast_pos_embed_interpolate(grid)
         assert_bytes(actual, expected)
+
+
+@pytest.mark.parametrize("tensor_path", ["0", "1"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("rows", [[[1, 4, 6]], [[1, 4, 6], [1, 4, 6], [1, 6, 8]], [[2, 4, 6], [3, 4, 6]]])
+def test_reused_position_metadata_matches_uncached(monkeypatch, tensor_path, dtype, rows):
+    model = make_model(dtype)
+    grid = torch.tensor(rows)
+    monkeypatch.setenv(POS_TENSOR, tensor_path)
+    with torch.inference_mode():
+        monkeypatch.setenv(POS_REUSE, "0")
+        expected = model.fast_pos_embed_interpolate(grid)
+        monkeypatch.setenv(POS_REUSE, "1")
+        actual = model.fast_pos_embed_interpolate(grid)
+    assert_bytes(actual, expected)
+
+
+@pytest.mark.parametrize("tensor_path", ["0", "1"])
+@pytest.mark.parametrize("enabled", [None, "0", "1"])
+def test_reused_position_metadata_computes_each_size_once(monkeypatch, tensor_path, enabled):
+    model = make_model()
+    grid = torch.tensor([[1, 4, 6], [1, 4, 6], [2, 6, 8], [1, 8, 4], [1, 6, 8], [3, 4, 6]])
+    monkeypatch.setenv(POS_TENSOR, tensor_path)
+    if enabled is None:
+        monkeypatch.delenv(POS_REUSE, raising=False)
+    else:
+        monkeypatch.setenv(POS_REUSE, enabled)
+    original = torch.linspace
+    calls = []
+
+    def tracked(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "linspace", tracked)
+    with torch.inference_mode():
+        model.fast_pos_embed_interpolate(grid)
+    assert len(calls) == (6 if enabled == "1" else 12)
+
+
+@pytest.mark.parametrize("tensor_path", ["0", "1"])
+def test_reused_position_metadata_is_request_local(monkeypatch, tensor_path):
+    model = make_model()
+    monkeypatch.setenv(POS_TENSOR, tensor_path)
+    monkeypatch.setenv(POS_REUSE, "1")
+    original = torch.linspace
+    calls = []
+
+    def tracked(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "linspace", tracked)
+    with torch.inference_mode():
+        model.fast_pos_embed_interpolate(torch.tensor([[1, 4, 6], [2, 4, 6]]))
+        model.fast_pos_embed_interpolate(torch.tensor([[1, 4, 6], [1, 6, 8]]))
+        model.fast_pos_embed_interpolate(torch.tensor([[1, 4, 6], [2, 4, 6]]))
+    assert len(calls) == 8

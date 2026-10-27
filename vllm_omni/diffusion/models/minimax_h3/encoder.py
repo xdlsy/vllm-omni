@@ -677,6 +677,8 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
     def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
         grid_thw_list = grid_thw.tolist()
         tensor_metadata = os.environ.get("VLLM_OMNI_H3_VISION_POS_TENSOR", "0") == "1"
+        reuse_metadata = os.environ.get("VLLM_OMNI_H3_VISION_POS_REUSE", "0") == "1"
+        metadata_cache: dict[tuple[int, int], tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
         grid_ts = [row[0] for row in grid_thw_list]
         grid_hs = [row[1] for row in grid_thw_list]
         grid_ws = [row[2] for row in grid_thw_list]
@@ -684,28 +686,34 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
         idx_list = [[] for _ in range(4)]
         weight_list = [[] for _ in range(4)]
         for _, h, w in grid_thw_list:
-            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
-            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
-            h_idxs_floor = h_idxs.int()
-            w_idxs_floor = w_idxs.int()
-            h_idxs_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
-            w_idxs_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
-            dh = h_idxs - h_idxs_floor
-            dw = w_idxs - w_idxs_floor
-            base_h = h_idxs_floor * self.num_grid_per_side
-            base_h_ceil = h_idxs_ceil * self.num_grid_per_side
-            indices = [
-                (base_h[None].T + w_idxs_floor[None]).flatten(),
-                (base_h[None].T + w_idxs_ceil[None]).flatten(),
-                (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
-                (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
-            ]
-            weights = [
-                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
-                ((1 - dh)[None].T * dw[None]).flatten(),
-                (dh[None].T * (1 - dw)[None]).flatten(),
-                (dh[None].T * dw[None]).flatten(),
-            ]
+            if reuse_metadata and (h, w) in metadata_cache:
+                indices, weights = metadata_cache[h, w]
+            else:
+                h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
+                w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
+                h_idxs_floor = h_idxs.int()
+                w_idxs_floor = w_idxs.int()
+                h_idxs_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+                w_idxs_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+                dh = h_idxs - h_idxs_floor
+                dw = w_idxs - w_idxs_floor
+                base_h = h_idxs_floor * self.num_grid_per_side
+                base_h_ceil = h_idxs_ceil * self.num_grid_per_side
+                indices = [
+                    (base_h[None].T + w_idxs_floor[None]).flatten(),
+                    (base_h[None].T + w_idxs_ceil[None]).flatten(),
+                    (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
+                    (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
+                ]
+                weights = [
+                    ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
+                    ((1 - dh)[None].T * dw[None]).flatten(),
+                    (dh[None].T * (1 - dw)[None]).flatten(),
+                    (dh[None].T * dw[None]).flatten(),
+                ]
+                if reuse_metadata:
+                    # Geometry only; this cache dies with the current forward.
+                    metadata_cache[h, w] = indices, weights
             for i in range(4):
                 if tensor_metadata:
                     idx_list[i].append(indices[i])
