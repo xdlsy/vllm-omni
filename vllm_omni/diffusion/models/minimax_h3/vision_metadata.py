@@ -9,6 +9,19 @@ from threading import RLock
 import torch
 
 
+def build_rotary_positions(grid: list[list[int]], merge_size: int) -> torch.Tensor:
+    """Construct only integer coordinates on CPU, in the original token order."""
+    parts = []
+    for frames, height, width in grid:
+        rows = torch.arange(height, device="cpu").view(height // merge_size, merge_size)
+        cols = torch.arange(width, device="cpu").view(width // merge_size, merge_size)
+        row_ids = rows[:, None, :, None].expand(-1, width // merge_size, -1, merge_size)
+        col_ids = cols[None, :, None, :].expand(height // merge_size, -1, merge_size, -1)
+        coords = torch.stack((row_ids, col_ids), dim=-1).reshape(-1, 2)
+        parts.append(coords.repeat(frames, 1))
+    return torch.cat(parts, dim=0)
+
+
 class CpuTensorCache:
     def __init__(self, max_entries: int = 8, max_bytes: int = 8 * 1024**2):
         self.max_entries = max_entries

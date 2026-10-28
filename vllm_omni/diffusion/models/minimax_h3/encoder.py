@@ -50,6 +50,7 @@ from vllm_omni.diffusion.offloader.module_residency import (
     PinnedModuleStager,
 )
 
+from . import vision_metadata
 from .vision_metadata import CpuTensorCache
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
@@ -672,6 +673,9 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
         max_hw = max(max(h, w) for _, h, w in grid_thw_list)
         freq_table = self.rotary_pos_emb(max_hw).to(device=grid_thw.device)
         device = freq_table.device
+        if os.environ.get("VLLM_OMNI_H3_VISION_ROTARY_CPU", "0") == "1":
+            pos_ids = vision_metadata.build_rotary_positions(grid_thw_list, merge_size).to(device=device)
+            return freq_table[pos_ids].flatten(1)
         total_tokens = sum(t * h * w for t, h, w in grid_thw_list)
         pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
         offset = 0

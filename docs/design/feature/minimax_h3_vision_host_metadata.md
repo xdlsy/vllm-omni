@@ -45,3 +45,7 @@ timing must include the single preparation read before the block loop.
 ## Cross-request CPU geometry cache (experimental)
 
 Set `VLLM_OMNI_H3_VISION_POS_CACHE=1` to cache final CPU interpolation indices and dtype-converted weights in eval plus inference mode. It also selects the tensor metadata path. The model-local LRU keeps at most 8 entries and 8 MiB; oversized entries are computed without retention. Keys include the ordered full grid, position-table size and dtype. Device/dtype moves clear the cache. Learned embeddings are read afresh on every call; training/autograd use the original path. Cache contents are disposable and omitted from serialization. No NPU correctness or performance validation has been performed for this candidate.
+
+## CPU rotary coordinates (experimental)
+
+`VLLM_OMNI_H3_VISION_ROTARY_CPU=1` builds integer row/column coordinates on CPU in frame, merged-block, intra-block order and transfers one packed coordinate tensor. Frequency-table arithmetic, lookup and cos/sin stay on the original device. This is independent of the interpolation cache and does not cache learned data. CPU exact-output checks cover rectangular, repeated and multi-frame grids; NPU validation remains pending.
