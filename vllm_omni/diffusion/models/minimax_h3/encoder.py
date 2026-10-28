@@ -50,8 +50,11 @@ from vllm_omni.diffusion.offloader.module_residency import (
     PinnedModuleStager,
 )
 
+from .vision_metadata import CpuTensorCache
+
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
+
 
 logger = init_logger(__name__)
 
@@ -648,6 +651,7 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
         self.patch_embed = MiniMaxH3Qwen3VLVisionPatchEmbed(config=config)
         self.pos_embed = nn.Embedding(config.num_position_embeddings, config.hidden_size)
         self.num_grid_per_side = int(config.num_position_embeddings**0.5)
+        self._position_metadata_cache = CpuTensorCache()
 
         head_dim = config.hidden_size // config.num_heads
         self.rotary_pos_emb = MiniMaxH3Qwen3VLVisionRotaryEmbedding(head_dim // 2)
@@ -691,14 +695,12 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
         embeddings = embeddings.flatten(1)
         return embeddings
 
-    def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        grid_thw_list = grid_thw.tolist()
-        tensor_metadata = os.environ.get("VLLM_OMNI_H3_VISION_POS_TENSOR", "0") == "1"
-        reuse_metadata = os.environ.get("VLLM_OMNI_H3_VISION_POS_REUSE", "0") == "1"
+    def _apply(self, fn, recurse=True):
+        self._position_metadata_cache.clear()
+        return super()._apply(fn, recurse=recurse)
+
+    def _build_position_metadata(self, grid_thw_list, tensor_metadata, reuse_metadata):
         metadata_cache: dict[tuple[int, int], tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
-        grid_ts = [row[0] for row in grid_thw_list]
-        grid_hs = [row[1] for row in grid_thw_list]
-        grid_ws = [row[2] for row in grid_thw_list]
         device = self.pos_embed.weight.device
         idx_list = [[] for _ in range(4)]
         weight_list = [[] for _ in range(4)]
@@ -744,11 +746,38 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
             weight_cpu = torch.stack([torch.cat(parts) for parts in weight_list]).to(
                 dtype=self.pos_embed.weight.dtype, device="cpu"
             )
-            idx_tensor = idx_cpu.to(device=device)
-            weight_tensor = weight_cpu.to(device=device)
+            return idx_cpu, weight_cpu
         else:
             idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
             weight_tensor = torch.tensor(weight_list, dtype=self.pos_embed.weight.dtype, device=device)
+        return idx_tensor, weight_tensor
+
+    def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        grid_thw_list = grid_thw.tolist()
+        cache_enabled = (
+            os.environ.get("VLLM_OMNI_H3_VISION_POS_CACHE", "0") == "1"
+            and not self.training
+            and torch.is_inference_mode_enabled()
+        )
+        key = (self.num_grid_per_side, self.pos_embed.weight.dtype, tuple(map(tuple, grid_thw_list)))
+        metadata = self._position_metadata_cache.get(key) if cache_enabled else None
+        tensor_metadata = cache_enabled or os.environ.get("VLLM_OMNI_H3_VISION_POS_TENSOR", "0") == "1"
+        if metadata is None:
+            metadata = self._build_position_metadata(
+                grid_thw_list,
+                tensor_metadata,
+                os.environ.get("VLLM_OMNI_H3_VISION_POS_REUSE", "0") == "1",
+            )
+            if cache_enabled:
+                self._position_metadata_cache.put(key, metadata)
+        idx_tensor, weight_tensor = metadata
+        device = self.pos_embed.weight.device
+        if tensor_metadata:
+            idx_tensor = idx_tensor.to(device=device)
+            weight_tensor = weight_tensor.to(device=device)
+        grid_ts = [row[0] for row in grid_thw_list]
+        grid_hs = [row[1] for row in grid_thw_list]
+        grid_ws = [row[2] for row in grid_thw_list]
         pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
         patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])

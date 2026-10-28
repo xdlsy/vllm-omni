@@ -41,3 +41,7 @@ The tuple is not retained across requests. The default path continues reading
 the original device boundaries in each attention call. Removing the reads does
 not imply that the whole Attention startup gap disappears; end-to-end vision
 timing must include the single preparation read before the block loop.
+
+## Cross-request CPU geometry cache (experimental)
+
+Set `VLLM_OMNI_H3_VISION_POS_CACHE=1` to cache final CPU interpolation indices and dtype-converted weights in eval plus inference mode. It also selects the tensor metadata path. The model-local LRU keeps at most 8 entries and 8 MiB; oversized entries are computed without retention. Keys include the ordered full grid, position-table size and dtype. Device/dtype moves clear the cache. Learned embeddings are read afresh on every call; training/autograd use the original path. Cache contents are disposable and omitted from serialization. No NPU correctness or performance validation has been performed for this candidate.

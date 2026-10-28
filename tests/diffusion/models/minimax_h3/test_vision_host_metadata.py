@@ -13,11 +13,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 POS_TENSOR = "VLLM_OMNI_H3_VISION_POS_TENSOR"
 POS_REUSE = "VLLM_OMNI_H3_VISION_POS_REUSE"
 LENGTHS = "VLLM_OMNI_H3_VISION_LENGTHS"
+POS_CACHE = "VLLM_OMNI_H3_VISION_POS_CACHE"
 
 
 @pytest.fixture(autouse=True)
 def disable_metadata_candidates(monkeypatch):
-    for key in (POS_TENSOR, POS_REUSE, LENGTHS):
+    for key in (POS_TENSOR, POS_REUSE, LENGTHS, POS_CACHE):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -155,6 +156,59 @@ def make_pixels(model, grid):
     width = model.config.in_channels * model.config.temporal_patch_size * model.config.patch_size**2
     generator = torch.Generator().manual_seed(123)
     return torch.randn(count, width, generator=generator).to(model.pos_embed.weight.dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_position_cache_hits_and_keeps_weight_updates_live(monkeypatch, dtype):
+    model = make_model(dtype)
+    grid = torch.tensor([[1, 4, 6], [1, 4, 6], [1, 6, 8]])
+    with torch.inference_mode():
+        expected = model.fast_pos_embed_interpolate(grid)
+        monkeypatch.setenv(POS_CACHE, "1")
+        assert_bytes(model.fast_pos_embed_interpolate(grid), expected)
+
+        def no_geometry(*args, **kwargs):
+            raise AssertionError("cache hit rebuilt geometry")
+
+        monkeypatch.setattr(torch, "linspace", no_geometry)
+        assert_bytes(model.fast_pos_embed_interpolate(grid), expected)
+        model.pos_embed.weight.add_(1)
+        actual = model.fast_pos_embed_interpolate(grid)
+        assert not torch.equal(actual, expected)
+
+
+def test_position_cache_is_bounded_and_separates_order_and_dtype(monkeypatch):
+    model = make_model()
+    monkeypatch.setenv(POS_CACHE, "1")
+    with torch.inference_mode():
+        for h in range(2, 22, 2):
+            model.fast_pos_embed_interpolate(torch.tensor([[1, h, 4]]))
+        assert len(model._position_metadata_cache) <= 8
+        assert model._position_metadata_cache.nbytes <= 8 * 1024**2
+        for rows in ([[1, 4, 6], [1, 6, 8]], [[1, 6, 8], [1, 4, 6]]):
+            grid = torch.tensor(rows)
+            actual = model.fast_pos_embed_interpolate(grid)
+            monkeypatch.setenv(POS_CACHE, "0")
+            assert_bytes(actual, model.fast_pos_embed_interpolate(grid))
+            monkeypatch.setenv(POS_CACHE, "1")
+        model.to(dtype=torch.bfloat16)
+        assert len(model._position_metadata_cache) == 0
+        assert model.fast_pos_embed_interpolate(grid).dtype == torch.bfloat16
+
+
+def test_cpu_metadata_cache_rejects_oversized_entries():
+    from vllm_omni.diffusion.models.minimax_h3.vision_metadata import CpuTensorCache
+
+    cache = CpuTensorCache(max_entries=2, max_bytes=16)
+    cache.put("a", (torch.ones(2),))
+    cache.put("large", (torch.ones(5),))
+    assert cache.get("a") is not None
+    assert cache.get("large") is None
+    cache.put("b", (torch.zeros(2),))
+    cache.get("a")
+    cache.put("c", (torch.zeros(2),))
+    assert cache.get("b") is None
+    assert cache.nbytes == 16
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
