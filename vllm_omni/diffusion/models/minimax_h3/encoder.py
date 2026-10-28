@@ -50,7 +50,7 @@ from vllm_omni.diffusion.offloader.module_residency import (
     PinnedModuleStager,
 )
 
-from . import vision_metadata
+from . import vision_metadata, vision_offload
 from .vision_metadata import CpuTensorCache
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
@@ -802,6 +802,8 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
         hidden_states: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        if os.environ.get("VLLM_OMNI_H3_VISION_EARLY_PREFETCH", "0") == "1" and self.blocks:
+            vision_offload.prefetch_first_block(self.blocks[0])
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds

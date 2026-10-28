@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -64,3 +66,20 @@ def test_cpu_rotary_path_preserves_full_vision(monkeypatch, dtype):
     assert_bytes(actual[0], expected[0])
     for a, b in zip(actual[1], expected[1]):
         assert_bytes(a, b)
+
+
+def test_early_prefetch_precedes_patch_and_keeps_block_calls(monkeypatch):
+    model = make_model()
+    order = []
+    hook = SimpleNamespace(prefetch_current_layer=lambda: order.append("prefetch"))
+    model.blocks[0]._hook_registry = SimpleNamespace(get_hook=lambda name: hook)
+    handle = model.patch_embed.register_forward_pre_hook(lambda *_: order.append("patch"))
+    grid = torch.tensor([[1, 4, 6]])
+    with torch.inference_mode():
+        model(make_pixels(model, grid), grid)
+        assert order == ["patch"]
+        order.clear()
+        monkeypatch.setenv("VLLM_OMNI_H3_VISION_EARLY_PREFETCH", "1")
+        model(make_pixels(model, grid), grid)
+    handle.remove()
+    assert order == ["prefetch", "patch"]

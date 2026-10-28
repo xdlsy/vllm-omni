@@ -44,8 +44,44 @@ timing must include the single preparation read before the block loop.
 
 ## Cross-request CPU geometry cache (experimental)
 
-Set `VLLM_OMNI_H3_VISION_POS_CACHE=1` to cache final CPU interpolation indices and dtype-converted weights in eval plus inference mode. It also selects the tensor metadata path. The model-local LRU keeps at most 8 entries and 8 MiB; oversized entries are computed without retention. Keys include the ordered full grid, position-table size and dtype. Device/dtype moves clear the cache. Learned embeddings are read afresh on every call; training/autograd use the original path. Cache contents are disposable and omitted from serialization. No NPU correctness or performance validation has been performed for this candidate.
+Set `VLLM_OMNI_H3_VISION_POS_CACHE=1` to cache final CPU interpolation indices
+and dtype-converted weights in eval plus inference mode. It also selects the
+tensor metadata path. The model-local LRU keeps at most 8 entries and 8 MiB;
+oversized entries are computed without retention. Keys include the ordered
+full grid, position-table size and dtype. Device/dtype moves clear the cache.
+Learned embeddings are read afresh on every call; training/autograd use the
+original path. Cache contents are disposable and omitted from serialization.
 
 ## CPU rotary coordinates (experimental)
 
-`VLLM_OMNI_H3_VISION_ROTARY_CPU=1` builds integer row/column coordinates on CPU in frame, merged-block, intra-block order and transfers one packed coordinate tensor. Frequency-table arithmetic, lookup and cos/sin stay on the original device. This is independent of the interpolation cache and does not cache learned data. CPU exact-output checks cover rectangular, repeated and multi-frame grids; NPU validation remains pending.
+`VLLM_OMNI_H3_VISION_ROTARY_CPU=1` builds integer row/column coordinates on CPU
+in frame, merged-block, intra-block order and transfers one packed coordinate
+tensor. Frequency-table arithmetic, lookup and cos/sin stay on the original
+device. This is independent of the interpolation cache and does not cache
+learned data. CPU exact-output checks cover rectangular, repeated and
+multi-frame grids.
+
+## Early first-block prefetch (experimental)
+
+`VLLM_OMNI_H3_VISION_EARLY_PREFETCH=1` asks the first vision block's DLO hook
+to start its current weights before PatchEmbed and position preparation. Only
+rank-local group heads with shared-slot ownership tracking participate; other
+layouts retain the original path. The original pre-forward hook still waits
+for readiness and rechecks ownership, including synchronous restoration if
+another group overwrites the slot. Collective ordering is unchanged. CPU
+protocol tests cover async start, readiness wait and overwritten-slot fallback.
+
+## Validation scope
+
+Real-weight Ascend NPU checks covered individual candidates and their combined
+path with rank-local DLO, including repeated, rectangular and multi-frame
+grids. Both intermediate-checkpoint and final-output-only comparisons were
+byte-identical for the tested inputs. Eight-rank service checks also matched
+the vision checkpoints. These results do not establish correctness for every
+device, shape, dtype or offloader layout.
+
+The selected experimental combination enables the three switches above along
+with tensor position metadata, matching-grid reuse and shared sequence lengths.
+All switches remain off by default. Timing observations are exploratory; full
+service output determinism has not passed, so these checks do not establish
+end-to-end losslessness or an accepted end-to-end speedup.

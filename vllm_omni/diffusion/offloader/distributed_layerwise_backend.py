@@ -795,6 +795,29 @@ class DistributedLayerwiseOffloadHook(ModelHook):
     #  ModelHook interface                                                #
     # ------------------------------------------------------------------ #
 
+    def prefetch_current_layer(self) -> bool:
+        """Start a rank-local group head early; pre_forward still owns waits.
+
+        No collective is moved across model execution boundaries. Ownership
+        is stamped by the existing prefetch path and rechecked at use, so a
+        later slot overwrite still takes the original synchronous fallback.
+        """
+        if (
+            self.dp_size != 1
+            or not self._is_group_first
+            or self._prev_hook is None
+            or self._shared_slot_group is None
+            or self._shared_slot_owner is None
+        ):
+            return False
+        if self._prev_hook._prefetched_slot is not None:
+            self.current_slot = self._prev_hook._prefetched_slot
+        slot = self.current_slot
+        if self._shared_slot_group[slot] == self._group_id and self._shared_slot_owner[slot] == id(self._prev_hook):
+            return False
+        self._prev_hook.prefetch_layer(slot, non_blocking=True)
+        return True
+
     def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
         # Dynamic slot tracking: read current_slot from the previous hook's
         # _prefetched_slot (the slot where this block's data was actually
