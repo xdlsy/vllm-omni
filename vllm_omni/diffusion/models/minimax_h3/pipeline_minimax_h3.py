@@ -44,6 +44,7 @@ from vllm_omni.diffusion.models.interface import (
     SupportImageInput,
     SupportsComponentDiscovery,
 )
+from vllm_omni.diffusion.models.minimax_h3.image_preprocessing import preprocess_images
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader import (
     BoundedAllocatorCache,
@@ -2672,7 +2673,7 @@ class MiniMaxH3Pipeline(
                 if prepared is None:
                     raise ValueError("rank 0 must prepare MiniMax H3 text inputs")
                 if prepared.images:
-                    vision = self.processor.image_processor(images=prepared.images, return_tensors="pt")
+                    vision = preprocess_images(self.processor.image_processor, prepared.images)
                     vision_kwargs.update(
                         pixel_values=vision["pixel_values"],
                         image_grid_thw=vision["image_grid_thw"],
