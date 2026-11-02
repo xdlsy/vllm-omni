@@ -242,7 +242,12 @@ def test_pipeline_image_call_uses_candidate():
     source = Path(candidate.__file__).with_name("pipeline_minimax_h3.py")
     tree = ast.parse(source.read_text(encoding="utf8"))
     method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "encode_prompt")
+    import os
+    from contextlib import nullcontext
+
     namespace = {
+        "os": os,
+        "nullcontext": nullcontext,
         "torch": torch,
         "preprocess_images": candidate.preprocess_images,
         "_dit_rank_world": lambda: (None, 0, 1),
