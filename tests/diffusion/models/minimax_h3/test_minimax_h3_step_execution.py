@@ -594,6 +594,7 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     context = {
         "height": 96,
         "width": 64,
+        "fps": 24,
         "preencode_mp4": True,
         "preencode_batch_frames": batch_frames,
         "latent_t": 2,
@@ -639,6 +640,8 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
         prompt="a prompt",
     )
     pipeline.prepare_encode(state)
+
+    assert state.extra[mod._STEP_SHAPE]["fps"] == 24
 
     # The runner slices the batched velocity by this row count.
     assert state.latents.shape == (int(branch.img_pos.shape[0]), 96)
