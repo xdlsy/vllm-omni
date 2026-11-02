@@ -160,3 +160,26 @@ def test_pinned_masters_are_allocated_once_and_reused():
             residency.offload()
         assert len(calls) == initial_calls
         assert masters == [group.master.data_ptr() for group in residency.stagers[0]._groups]
+
+
+@pytest.mark.parametrize("resident_layers", [-1, 2])
+def test_full_and_partial_device_residency_reuse_weights(resident_layers):
+    owner = model()
+    residency = EncoderResidency(owner, torch.device("cpu"), EncoderResidencyOptions(resident_layers=resident_layers))
+    residency.load()
+    retained = [stager for stager in residency.stagers if stager.retain_device_storage]
+    assert len(retained) == 1
+    ptrs = [storage.data_ptr() for storage in retained[0]._device_storages]
+    residency.offload()
+    assert ptrs == [storage.data_ptr() for storage in retained[0]._device_storages]
+    residency.load()
+    assert ptrs == [storage.data_ptr() for storage in retained[0]._device_storages]
+
+
+def test_partition_rejects_shared_storage_and_excess_residency():
+    owner = model()
+    owner.text_model.layers[2].weight = owner.text_model.layers[0].weight
+    with pytest.raises(ValueError, match="storage alias"):
+        EncoderResidency(owner, torch.device("cpu"), EncoderResidencyOptions(resident_layers=2))
+    with pytest.raises(ValueError, match="resident_layers"):
+        EncoderResidency(model(), torch.device("cpu"), EncoderResidencyOptions(resident_layers=100))

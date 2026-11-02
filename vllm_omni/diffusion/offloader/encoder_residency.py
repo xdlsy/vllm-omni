@@ -26,6 +26,11 @@ class EncoderResidencyOptions:
     frozen_master: bool = False
     cache_retention: bool = False
     pinned_buffers: bool = False
+    resident_layers: int = 0
+
+    def __post_init__(self) -> None:
+        if self.resident_layers < -1:
+            raise ValueError("resident_layers must be -1 (all), 0 (off), or a positive layer count")
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> EncoderResidencyOptions:
@@ -40,11 +45,11 @@ class EncoderResidencyOptions:
             if value not in ("0", "1"):
                 raise ValueError("VLLM_OMNI_ENCODER_" + name + " must be 0 or 1")
             values[field] = value == "1"
-        return cls(**values)
+        return cls(**values, resident_layers=int(env.get("VLLM_OMNI_ENCODER_RESIDENT_LAYERS", "0")))
 
     @property
     def enabled(self) -> bool:
-        return self.frozen_master or self.cache_retention or self.pinned_buffers
+        return self.frozen_master or self.cache_retention or self.pinned_buffers or self.resident_layers != 0
 
 
 class EncoderResidency:
@@ -56,11 +61,49 @@ class EncoderResidency:
         self.device = device
         self.cache = BoundedAllocatorCache(device) if options.cache_retention else None
         self.stats = {"loads": 0, "offloads": 0}
+        partitions: list[tuple[list[nn.Module], bool]] = [([module], options.resident_layers == -1)]
+        if options.resident_layers > 0:
+            layers = list(module.text_model.layers)
+            if options.resident_layers > len(layers):
+                raise ValueError("resident_layers exceeds the encoder layer count")
+            count = options.resident_layers
+            other = [module.vision, *[child for name, child in module.text_model.named_children() if name != "layers"]]
+            partitions = [(layers[:count], True), ([*other, *layers[count:]], False)]
+        self._validate_partition_aliases(partitions)
+        use_masters = options.frozen_master or options.pinned_buffers or options.resident_layers != 0
         self.stagers = (
-            [PinnedModuleStager(module, device, pin_memory=options.pinned_buffers, cache_retention=self.cache)]
-            if options.frozen_master or options.pinned_buffers
+            [
+                PinnedModuleStager(
+                    members,
+                    device,
+                    pin_memory=options.pinned_buffers,
+                    cache_retention=self.cache,
+                    retain_device_storage=resident,
+                )
+                for members, resident in partitions
+            ]
+            if use_masters
             else []
         )
+
+    @staticmethod
+    def _validate_partition_aliases(partitions: list[tuple[list[nn.Module], bool]]) -> None:
+        owners: dict[tuple, int] = {}
+        for index, (members, _) in enumerate(partitions):
+            for member in members:
+                for target in (*member.parameters(), *member.buffers()):
+                    tensor = PinnedModuleStager._local_tensor(target)
+                    if tensor.is_meta:
+                        raise ValueError("Encoder residency cannot snapshot meta tensors")
+                    storage = tensor.untyped_storage()
+                    if not storage.nbytes():
+                        continue
+                    key = (tensor.device, storage.data_ptr(), storage.nbytes())
+                    if key in owners and owners[key] != index:
+                        raise ValueError(
+                            "Encoder storage alias crosses staging groups; use model grouping/full residency"
+                        )
+                    owners[key] = index
 
     def load(self) -> None:
         if not self.stagers:
