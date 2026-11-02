@@ -154,6 +154,7 @@ class PinnedModuleStager:
             self._transport_masters = [packed]
             self._transport_layout = [(0, offset, group.master.numel()) for offset, group in zip(offsets, self._groups)]
         self._device_storages: list[torch.Tensor] = []
+        self._pending_storages: list[torch.Tensor] = []
         self._restore_masters()
 
     @staticmethod
@@ -247,8 +248,27 @@ class PinnedModuleStager:
         else:
             self.cache_retention.release_if_needed(force=force)
 
-    def _load_once(self) -> None:
+    def prefetch(self) -> None:
+        """Enqueue H2D without rebinding or making compute wait for this group.
+
+        Pending storages remain strongly owned until load consumes the event or
+        offload synchronizes and drains an unused prefetch. CPU masters likewise
+        remain alive for the whole copy; teardown must drain before releasing.
+        """
+        if self.loaded or self._pending_storages or self._device_storages:
+            return
+        try:
+            self._enqueue_prefetch()
+        except BaseException:
+            self._cleanup_failed_load()
+            raise
+
+    def _enqueue_prefetch(self) -> None:
         transports = [torch.empty_like(master, device=self.device) for master in self._transport_masters]
+        # Publish ownership before submitting DMA, including partial-copy failures.
+        self._pending_storages = [
+            transports[index].narrow(0, offset, length) for index, offset, length in self._transport_layout
+        ]
         compute_stream = current_omni_platform.current_stream()
         self.copy_stream.wait_stream(compute_stream)
         with current_omni_platform.stream(self.copy_stream):
@@ -261,9 +281,15 @@ class PinnedModuleStager:
             transports[index].narrow(0, offset, length) for index, offset, length in self._transport_layout
         ]
 
-        self._bind(device_storages)
-        compute_stream.wait_event(self._ready_event)
-        self._device_storages = device_storages
+        self._pending_storages = device_storages
+
+    def _load_once(self) -> None:
+        if not self._pending_storages:
+            self._enqueue_prefetch()
+        current_omni_platform.current_stream().wait_event(self._ready_event)
+        self._bind(self._pending_storages)
+        self._device_storages = self._pending_storages
+        self._pending_storages = []
         self.loaded = True
 
     def _cleanup_failed_load(self) -> None:
@@ -273,6 +299,7 @@ class PinnedModuleStager:
             logger.debug("Device synchronization failed while cleaning up module staging", exc_info=True)
         self._restore_masters()
         self._device_storages.clear()
+        self._pending_storages.clear()
         self.loaded = False
         self._release_cache(force=True)
 
@@ -301,6 +328,10 @@ class PinnedModuleStager:
             raise
 
     def offload(self) -> None:
+        if self._pending_storages:
+            current_omni_platform.synchronize()
+            self._pending_storages.clear()
+            self._release_cache()
         if not self.loaded:
             return
 

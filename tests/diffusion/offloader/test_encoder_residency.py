@@ -250,3 +250,48 @@ def test_group_exception_cleanup_allows_next_request():
     for layer in owner.text_model.layers:
         layer(torch.ones(1, 3))
     residency.offload()
+
+
+def test_prefetch_does_not_rebind_or_wait_until_consumed():
+    from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager, current_omni_platform
+
+    owner = nn.Linear(3, 3)
+    stager = PinnedModuleStager(owner, torch.device("cpu"), pin_memory=False)
+    master = owner.weight.data_ptr()
+    with patch.object(current_omni_platform, "current_stream") as stream:
+        stager.prefetch()
+        stager.prefetch()
+        assert owner.weight.data_ptr() == master
+        assert stager._pending_storages
+        stream.return_value.wait_event.assert_not_called()
+        stager.load()
+        assert owner.weight.data_ptr() != master
+        assert not stager._pending_storages
+        stream.return_value.wait_event.assert_called_once()
+    stager.offload()
+
+
+def test_prefetch_unconsumed_storage_is_drained_on_failure_cleanup():
+    from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
+
+    stager = PinnedModuleStager(nn.Linear(3, 3), torch.device("cpu"), pin_memory=False)
+    stager.prefetch()
+    stager.offload()
+    assert not stager._pending_storages
+    assert not stager.loaded
+
+
+def test_prefetch_requires_grouping_and_pinned_buffers():
+    with pytest.raises(ValueError, match="prefetch"):
+        EncoderResidencyOptions(prefetch=True)
+    with patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor.clone()):
+        owner = model()
+        residency = EncoderResidency(
+            owner, torch.device("cpu"), EncoderResidencyOptions(prefetch=True, pinned_buffers=True, group_size=1)
+        )
+    residency.load()
+    owner.text_model.layers[0](torch.ones(1, 3))
+    next_index = residency.block_groups[1][1]
+    assert residency.stagers[next_index]._pending_storages
+    residency.offload()
+    assert not any(stager._pending_storages for stager in residency.stagers)

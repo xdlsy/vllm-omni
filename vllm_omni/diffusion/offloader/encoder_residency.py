@@ -29,8 +29,11 @@ class EncoderResidencyOptions:
     packed_transport: bool = False
     resident_layers: int = 0
     group_size: int = 0
+    prefetch: bool = False
 
     def __post_init__(self) -> None:
+        if self.prefetch and (not self.pinned_buffers or self.group_size < 1):
+            raise ValueError("prefetch requires PINNED_BUFFERS=1 and GROUP_SIZE>=1")
         if self.group_size < 0:
             raise ValueError("group_size must be 0 (model), 1 (layer), or a positive block count")
         if self.group_size and self.resident_layers == -1:
@@ -47,6 +50,7 @@ class EncoderResidencyOptions:
             ("cache_retention", "CACHE_RETENTION"),
             ("pinned_buffers", "PINNED_BUFFERS"),
             ("packed_transport", "PACKED_TRANSPORT"),
+            ("prefetch", "PREFETCH"),
         ):
             value = env.get("VLLM_OMNI_ENCODER_" + name, "0")
             if value not in ("0", "1"):
@@ -140,6 +144,11 @@ class EncoderResidency:
             if not self._active:
                 raise RuntimeError("Call encoder.load_to_device before grouped encoder execution")
             self.stagers[index].load()
+            if self.options.prefetch:
+                indices = [group_index for _, group_index in self.block_groups]
+                position = indices.index(index)
+                if position + 1 < len(indices):
+                    self.stagers[indices[position + 1]].prefetch()
 
         return before
 

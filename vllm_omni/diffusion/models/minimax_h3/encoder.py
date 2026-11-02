@@ -1292,6 +1292,12 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             raise ValueError("Encoder residency experiments currently require unquantized BF16 weights")
         return options.enabled
 
+    def close_omni_encoder_residency(self) -> None:
+        controller = getattr(self, "_encoder_residency", None)
+        if controller is not None:
+            controller.close()
+            self._encoder_residency = None
+
     def _encoder_residency_controller(self) -> EncoderResidency:
         controller = getattr(self, "_encoder_residency", None)
         if controller is None:

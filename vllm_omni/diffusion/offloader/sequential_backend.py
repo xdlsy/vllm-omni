@@ -302,6 +302,9 @@ def remove_sequential_offload(modules: list[nn.Module]) -> None:
             registry: HookRegistry | None = getattr(module, "_hook_registry", None)
             if registry is not None:
                 registry.remove_hook(SequentialOffloadHook._HOOK_NAME)
+                close_encoder = getattr(module, "close_omni_encoder_residency", None)
+                if callable(close_encoder):
+                    close_encoder()
                 logger.debug("Removed offload hook from %s", module.__class__.__name__)
         except BaseException as exc:
             logger.exception("Failed to remove offload hook from %s", module.__class__.__name__)
