@@ -44,6 +44,7 @@ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMetho
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
+from vllm_omni.diffusion.offloader.encoder_residency import EncoderResidency, EncoderResidencyOptions
 from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
@@ -1280,8 +1281,29 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             raise RuntimeError(f"MiniMax H3 text encoder weights not loaded: {len(missing)} params: {missing}")
         return loaded
 
+    def uses_omni_encoder_residency(self) -> bool:
+        options = getattr(self, "_encoder_residency_options", None)
+        if options is None:
+            options = EncoderResidencyOptions.from_env()
+            self._encoder_residency_options = options
+        if options.enabled and getattr(self, "_omni_layerwise_enabled", False):
+            raise ValueError("Encoder residency experiments cannot be combined with legacy layerwise offload")
+        if options.enabled and self.quant_config is not None:
+            raise ValueError("Encoder residency experiments currently require unquantized BF16 weights")
+        return options.enabled
+
+    def _encoder_residency_controller(self) -> EncoderResidency:
+        controller = getattr(self, "_encoder_residency", None)
+        if controller is None:
+            controller = EncoderResidency(self, self.device_target, self._encoder_residency_options)
+            self._encoder_residency = controller
+        return controller
+
     def load_to_device(self) -> None:
         if not self.is_loaded:
+            return
+        if self.uses_omni_encoder_residency():
+            self._encoder_residency_controller().load()
             return
         if getattr(self, "_omni_layerwise_enabled", False):
             stager = getattr(self, "_omni_non_block_stager", None)
@@ -1302,6 +1324,9 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
 
     def offload_to_cpu(self) -> None:
         if not self.is_loaded:
+            return
+        if self.uses_omni_encoder_residency():
+            self._encoder_residency_controller().offload()
             return
         if getattr(self, "_omni_layerwise_enabled", False):
             for hook in self._omni_layerwise_hooks:

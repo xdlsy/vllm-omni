@@ -130,7 +130,18 @@ class SequentialOffloadHook(ModelHook):
         hook = registry.get_hook(SequentialOffloadHook._HOOK_NAME) if registry is not None else None
         return hook._stager if isinstance(hook, SequentialOffloadHook) else None
 
+    def _uses_encoder_residency(self, module: nn.Module) -> bool:
+        enabled = getattr(module, "uses_omni_encoder_residency", None)
+        if callable(enabled) and enabled():
+            if self.use_hsdp:
+                raise ValueError("Encoder residency experiments do not support HSDP")
+            return True
+        return False
+
     def _to_cpu(self, module: nn.Module) -> None:
+        if self._uses_encoder_residency(module):
+            module.offload_to_cpu()
+            return
         stager = self._module_stager(module)
         if stager is not None:
             stager.offload()
@@ -149,6 +160,9 @@ class SequentialOffloadHook(ModelHook):
             current_omni_platform.empty_cache()
 
     def _to_gpu(self, module: nn.Module) -> None:
+        if self._uses_encoder_residency(module):
+            module.load_to_device()
+            return
         stager = self._module_stager(module)
         if stager is not None:
             stager.load()
