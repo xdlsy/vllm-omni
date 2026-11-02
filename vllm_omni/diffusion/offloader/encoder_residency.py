@@ -16,24 +16,30 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from .module_residency import PinnedModuleStager
+from vllm_omni.platforms import current_omni_platform
+
+from .module_residency import BoundedAllocatorCache, PinnedModuleStager
 
 
 @dataclass(frozen=True)
 class EncoderResidencyOptions:
     frozen_master: bool = False
+    cache_retention: bool = False
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> EncoderResidencyOptions:
         env = os.environ if environ is None else environ
-        value = env.get("VLLM_OMNI_ENCODER_FROZEN_MASTER", "0")
-        if value not in ("0", "1"):
-            raise ValueError("VLLM_OMNI_ENCODER_FROZEN_MASTER must be 0 or 1")
-        return cls(frozen_master=value == "1")
+        values = {}
+        for field, name in (("frozen_master", "FROZEN_MASTER"), ("cache_retention", "CACHE_RETENTION")):
+            value = env.get("VLLM_OMNI_ENCODER_" + name, "0")
+            if value not in ("0", "1"):
+                raise ValueError("VLLM_OMNI_ENCODER_" + name + " must be 0 or 1")
+            values[field] = value == "1"
+        return cls(**values)
 
     @property
     def enabled(self) -> bool:
-        return self.frozen_master
+        return self.frozen_master or self.cache_retention
 
 
 class EncoderResidency:
@@ -41,10 +47,19 @@ class EncoderResidency:
 
     def __init__(self, module: nn.Module, device: torch.device, options: EncoderResidencyOptions) -> None:
         self.options = options
+        self.module = module
+        self.device = device
+        self.cache = BoundedAllocatorCache(device) if options.cache_retention else None
         self.stats = {"loads": 0, "offloads": 0}
-        self.stagers = [PinnedModuleStager(module, device, pin_memory=False)]
+        self.stagers = (
+            [PinnedModuleStager(module, device, pin_memory=False, cache_retention=self.cache)]
+            if options.frozen_master
+            else []
+        )
 
     def load(self) -> None:
+        if not self.stagers:
+            self.module.to(self.device)
         try:
             for stager in self.stagers:
                 stager.load()
@@ -54,6 +69,12 @@ class EncoderResidency:
         self.stats["loads"] += 1
 
     def offload(self) -> None:
+        if not self.stagers:
+            self.module.to("cpu")
+            if self.cache is not None:
+                self.cache.release_if_needed()
+            else:
+                current_omni_platform.empty_cache()
         for stager in self.stagers:
             stager.offload()
         self.stats["offloads"] += 1

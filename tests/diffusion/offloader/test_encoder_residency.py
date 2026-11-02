@@ -4,6 +4,7 @@
 
 import ast
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -115,3 +116,27 @@ def test_full_encoder_and_sequential_hook_use_the_same_controller():
     encoder._omni_layerwise_enabled = True
     with pytest.raises(ValueError, match="legacy layerwise"):
         encoder.load_to_device()
+
+
+def test_cache_retention_is_independent_and_obeys_bounds():
+    from vllm_omni.diffusion.offloader.module_residency import current_omni_platform
+
+    options = EncoderResidencyOptions.from_env({"VLLM_OMNI_ENCODER_CACHE_RETENTION": "1"})
+    residency = EncoderResidency(model(), torch.device("cpu"), options)
+    assert not residency.stagers  # cache-only leaves the legacy copies intact
+    with (
+        patch.object(torch.accelerator, "memory_reserved", return_value=20),
+        patch.object(torch.accelerator, "memory_allocated", return_value=10),
+        patch.object(current_omni_platform, "get_device_memory", return_value=(80, 100)),
+        patch.object(current_omni_platform, "empty_cache") as release,
+    ):
+        residency.load()
+        residency.offload()
+        release.assert_not_called()
+    with (
+        patch.object(residency.cache, "_should_release", return_value=True),
+        patch.object(current_omni_platform, "empty_cache") as release,
+    ):
+        residency.load()
+        residency.offload()
+        release.assert_called_once()
