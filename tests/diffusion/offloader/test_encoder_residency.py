@@ -172,8 +172,11 @@ def test_full_and_partial_device_residency_reuse_weights(resident_layers):
     ptrs = [storage.data_ptr() for storage in retained[0]._device_storages]
     residency.offload()
     assert ptrs == [storage.data_ptr() for storage in retained[0]._device_storages]
+    first_copies = retained[0].stats["h2d_copies"]
     residency.load()
     assert ptrs == [storage.data_ptr() for storage in retained[0]._device_storages]
+    assert retained[0].stats["h2d_copies"] == first_copies
+    assert retained[0].stats["d2h_copies"] == 0
 
 
 def test_partition_rejects_shared_storage_and_excess_residency():
@@ -295,3 +298,89 @@ def test_prefetch_requires_grouping_and_pinned_buffers():
     assert residency.stagers[next_index]._pending_storages
     residency.offload()
     assert not any(stager._pending_storages for stager in residency.stagers)
+
+
+def test_reusable_buffers_keep_addresses_but_repeat_h2d_and_refresh_masters():
+    from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
+
+    owner = nn.Linear(3, 3)
+    stager = PinnedModuleStager(owner, torch.device("cpu"), pin_memory=False, reuse_device_buffers=True)
+    stager.load()
+    pointer = owner.weight.data_ptr()
+    stager.offload()
+    owner.weight.data.fill_(17)
+    stager.load()
+    assert owner.weight.data_ptr() == pointer
+    assert torch.all(owner.weight == 17)
+    assert stager.stats["buffer_reuses"] == 1
+    assert stager.stats["h2d_copies"] == 2 * len(stager._groups)
+    assert stager.stats["device_allocations"] == len(stager._groups)
+    stager.close()
+    assert not stager._reusable_transports
+    assert not stager._device_storages
+
+
+def test_resident_and_reusable_storage_are_not_conflated():
+    with pytest.raises(ValueError, match="reuse"):
+        EncoderResidencyOptions(resident_layers=1, reuse_buffers=True)
+    options = EncoderResidencyOptions.from_env({"VLLM_OMNI_ENCODER_REUSE_BUFFERS": "1"})
+    residency = EncoderResidency(model(), torch.device("cpu"), options)
+    assert residency.stagers
+    residency.load()
+    residency.offload()
+    assert residency.transport_stats["device_allocations"] > 0
+    assert residency.transport_stats["d2h_copies"] > 0
+    residency.close()
+    assert not any(stager._reusable_transports for stager in residency.stagers)
+
+
+def test_controller_attempts_all_group_cleanup_after_one_error():
+    owner = model()
+    residency = EncoderResidency(owner, torch.device("cpu"), EncoderResidencyOptions(group_size=1))
+    residency.load()
+    with (
+        patch.object(residency.stagers[0], "offload", side_effect=RuntimeError("cleanup failed")),
+        patch.object(residency.stagers[-1], "offload", wraps=residency.stagers[-1].offload) as last,
+    ):
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            residency.offload()
+        last.assert_called_once()
+
+
+@pytest.mark.parametrize("copy_back", [False, True])
+@pytest.mark.parametrize("coalesce", [False, True])
+def test_reuse_actual_allocation_count_across_three_requests(copy_back, coalesce):
+    from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
+
+    owner = nn.Linear(3, 3)
+    stager = PinnedModuleStager(
+        owner, torch.device("cpu"), pin_memory=False, reuse_device_buffers=True, coalesce=coalesce, copy_back=copy_back
+    )
+    count = len(stager._transport_masters)
+    with patch.object(torch, "empty_like", wraps=torch.empty_like) as allocate:
+        pointers = []
+        for _ in range(3):
+            stager.load()
+            pointers.append(owner.weight.data_ptr())
+            stager.offload()
+        assert len(set(pointers)) == 1
+        assert allocate.call_count == count
+    assert stager.stats["device_allocations"] == count
+    assert stager.stats["h2d_copies"] == 3 * count
+    assert stager.stats["d2h_copies"] == (3 * count if copy_back else 0)
+    stager.close()
+
+
+def test_failed_synchronization_keeps_storage_owned_for_retry():
+    from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager, current_omni_platform
+
+    stager = PinnedModuleStager(nn.Linear(3, 3), torch.device("cpu"), pin_memory=False)
+    stager.load()
+    storages = stager._device_storages
+    with patch.object(current_omni_platform, "synchronize", side_effect=RuntimeError("device lost")):
+        with pytest.raises(RuntimeError, match="device lost"):
+            stager.offload()
+    assert stager.loaded
+    assert stager._device_storages is storages
+    assert storages
+    stager.close()

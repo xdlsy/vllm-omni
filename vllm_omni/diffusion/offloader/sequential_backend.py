@@ -73,6 +73,8 @@ class SequentialOffloadHook(ModelHook):
         self._stager: PinnedModuleStager | None = None
 
     def initialize_hook(self, module: nn.Module) -> nn.Module:
+        # Validate incompatible encoder modes before installing movement state.
+        self._uses_encoder_residency(module)
         if self.persistent_staging and not self.use_hsdp:
             # Fixed staging storage keeps CUDA-graph-captured weight pointers
             # valid across offload/load swaps. HSDP keeps the plain move

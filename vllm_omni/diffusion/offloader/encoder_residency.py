@@ -3,8 +3,8 @@
 """Opt-in experiments for frozen MiniMax-H3 encoder storage ownership.
 
 Options are read once before the first transition. All defaults preserve legacy
-placement. Masters include buffers: these experiments require immutable inference
-weights and buffers and must not be used for training or stateful encoders.
+placement. Frozen-master and resident modes require immutable inference weights
+and buffers. Other storage modes copy buffers back; none support training.
 """
 
 from __future__ import annotations
@@ -15,10 +15,13 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+from vllm.logger import init_logger
 
 from vllm_omni.platforms import current_omni_platform
 
 from .module_residency import BoundedAllocatorCache, PinnedModuleStager
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -30,8 +33,11 @@ class EncoderResidencyOptions:
     resident_layers: int = 0
     group_size: int = 0
     prefetch: bool = False
+    reuse_buffers: bool = False
 
     def __post_init__(self) -> None:
+        if self.reuse_buffers and self.resident_layers != 0:
+            raise ValueError("reuse buffers cannot be combined with resident weights")
         if self.prefetch and (not self.pinned_buffers or self.group_size < 1):
             raise ValueError("prefetch requires PINNED_BUFFERS=1 and GROUP_SIZE>=1")
         if self.group_size < 0:
@@ -51,6 +57,7 @@ class EncoderResidencyOptions:
             ("pinned_buffers", "PINNED_BUFFERS"),
             ("packed_transport", "PACKED_TRANSPORT"),
             ("prefetch", "PREFETCH"),
+            ("reuse_buffers", "REUSE_BUFFERS"),
         ):
             value = env.get("VLLM_OMNI_ENCODER_" + name, "0")
             if value not in ("0", "1"):
@@ -71,11 +78,12 @@ class EncoderResidencyOptions:
             or self.resident_layers != 0
             or self.packed_transport
             or self.group_size != 0
+            or self.reuse_buffers
         )
 
 
 class EncoderResidency:
-    """Own the immutable CPU masters for a full encoder, without D2H offload."""
+    """Own encoder storage transitions and optional block execution hooks."""
 
     def __init__(self, module: nn.Module, device: torch.device, options: EncoderResidencyOptions) -> None:
         self.options = options
@@ -116,6 +124,7 @@ class EncoderResidency:
             or options.resident_layers != 0
             or options.packed_transport
             or options.group_size != 0
+            or options.reuse_buffers
         )
         self.stagers = (
             [
@@ -125,8 +134,9 @@ class EncoderResidency:
                     pin_memory=options.pinned_buffers,
                     cache_retention=self.cache,
                     retain_device_storage=resident,
-                    copy_back=not options.frozen_master,
+                    copy_back=not options.frozen_master and not resident,
                     coalesce=options.packed_transport,
+                    reuse_device_buffers=options.reuse_buffers,
                 )
                 for members, resident in partitions
             ]
@@ -159,12 +169,23 @@ class EncoderResidency:
         return after
 
     def close(self) -> None:
+        first_error = None
         try:
             self.offload()
+        except BaseException as exc:
+            first_error = exc
+        try:
+            for stager in self.stagers:
+                try:
+                    stager.close()
+                except BaseException as exc:
+                    first_error = first_error or exc
         finally:
             for handle in self._handles:
                 handle.remove()
             self._handles.clear()
+        if first_error is not None:
+            raise first_error
 
     @staticmethod
     def _validate_partition_aliases(partitions: list[tuple[list[nn.Module], bool]]) -> None:
@@ -207,6 +228,26 @@ class EncoderResidency:
                 self.cache.release_if_needed()
             else:
                 current_omni_platform.empty_cache()
+        first_error = None
         for stager in self.stagers:
-            stager.offload()
+            try:
+                stager.offload()
+            except BaseException as exc:
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
         self.stats["offloads"] += 1
+        logger.info(
+            "MiniMax H3 encoder residency options=%s lifecycle=%s transport=%s",
+            self.options,
+            self.stats,
+            self.transport_stats,
+        )
+
+    @property
+    def transport_stats(self) -> dict[str, int]:
+        totals: dict[str, int] = {}
+        for stager in self.stagers:
+            for name, count in stager.stats.items():
+                totals[name] = totals.get(name, 0) + count
+        return totals

@@ -61,3 +61,16 @@ attribute-name heuristics.
 
 Shared selection and lifecycle behavior is defined in the
 [CPU Offloading design](README.md).
+
+## MiniMax-H3 encoder experiments
+
+The default movement behavior is unchanged. When explicitly enabled, MiniMax-H3
+encoder residency experiments route both manual component transitions and
+sequential hook transitions through the encoder's own storage controller.
+Quantized encoders, legacy encoder block offload and HSDP are rejected. Native
+block hooks are removed when sequential offload is disabled. The opt-in resident
+and reusable-buffer modes deliberately retain live device allocations and must
+be capacity-tested alongside subsequent DiT/VAE stages; they relax ordinary
+component memory exclusion. See the [experiment and NPU validation guide](
+../../../user_guide/diffusion/offloader/minimax_h3_encoder_experiments.md) for
+configuration, ownership, prerequisites and acceptance evidence.

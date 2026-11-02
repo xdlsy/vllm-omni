@@ -123,6 +123,7 @@ class PinnedModuleStager:
         retain_device_storage: bool = False,
         coalesce: bool = False,
         copy_back: bool = False,
+        reuse_device_buffers: bool = False,
     ) -> None:
         modules = (module,) if isinstance(module, nn.Module) else tuple(module)
         if not modules or not all(isinstance(item, nn.Module) for item in modules):
@@ -134,8 +135,19 @@ class PinnedModuleStager:
         self.cache_retention = cache_retention
         self.retain_device_storage = retain_device_storage
         self.loaded = False
+        if retain_device_storage and reuse_device_buffers:
+            raise ValueError("reuse_device_buffers and resident weights are distinct, mutually exclusive modes")
         self.copy_back = copy_back
-        self.stats = {"h2d_copies": 0, "h2d_bytes": 0, "d2h_copies": 0, "d2h_bytes": 0}
+        self.reuse_device_buffers = reuse_device_buffers
+        self._reusable_transports: list[torch.Tensor] = []
+        self.stats = {
+            "h2d_copies": 0,
+            "h2d_bytes": 0,
+            "d2h_copies": 0,
+            "d2h_bytes": 0,
+            "device_allocations": 0,
+            "buffer_reuses": 0,
+        }
         self._groups = self._snapshot_groups(modules, pin_memory=pin_memory and not coalesce)
         self._transport_masters = [group.master for group in self._groups]
         self._transport_layout = [(index, 0, group.master.numel()) for index, group in enumerate(self._groups)]
@@ -155,6 +167,7 @@ class PinnedModuleStager:
             self._transport_layout = [(0, offset, group.master.numel()) for offset, group in zip(offsets, self._groups)]
         self._device_storages: list[torch.Tensor] = []
         self._pending_storages: list[torch.Tensor] = []
+        self._active_transports: list[torch.Tensor] = []
         self._restore_masters()
 
     @staticmethod
@@ -264,7 +277,15 @@ class PinnedModuleStager:
             raise
 
     def _enqueue_prefetch(self) -> None:
-        transports = [torch.empty_like(master, device=self.device) for master in self._transport_masters]
+        if self._reusable_transports:
+            transports = self._reusable_transports
+            self.stats["buffer_reuses"] += 1
+        else:
+            transports = [torch.empty_like(master, device=self.device) for master in self._transport_masters]
+            self.stats["device_allocations"] += len(transports)
+            if self.reuse_device_buffers:
+                self._reusable_transports = transports
+        self._active_transports = transports
         # Publish ownership before submitting DMA, including partial-copy failures.
         self._pending_storages = [
             transports[index].narrow(0, offset, length) for index, offset, length in self._transport_layout
@@ -277,11 +298,6 @@ class PinnedModuleStager:
                 self.stats["h2d_copies"] += 1
                 self.stats["h2d_bytes"] += master.numel()
             self._ready_event.record(self.copy_stream)
-        device_storages = [
-            transports[index].narrow(0, offset, length) for index, offset, length in self._transport_layout
-        ]
-
-        self._pending_storages = device_storages
 
     def _load_once(self) -> None:
         if not self._pending_storages:
@@ -296,10 +312,14 @@ class PinnedModuleStager:
         try:
             current_omni_platform.synchronize()
         except Exception:
-            logger.debug("Device synchronization failed while cleaning up module staging", exc_info=True)
+            # Keep all backing allocations alive if device completion is unknown.
+            logger.exception("Device synchronization failed while cleaning up module staging")
+            raise
         self._restore_masters()
         self._device_storages.clear()
         self._pending_storages.clear()
+        self._active_transports = []
+        self._reusable_transports.clear()
         self.loaded = False
         self._release_cache(force=True)
 
@@ -331,6 +351,7 @@ class PinnedModuleStager:
         if self._pending_storages:
             current_omni_platform.synchronize()
             self._pending_storages.clear()
+            self._active_transports = []
             self._release_cache()
         if not self.loaded:
             return
@@ -340,20 +361,31 @@ class PinnedModuleStager:
         try:
             current_omni_platform.synchronize()
             if self.copy_back:
-                for storage, group in zip(self._device_storages, self._groups):
-                    group.master.copy_(storage)
+                for storage, master in zip(self._active_transports, self._transport_masters):
+                    master.copy_(storage)
                     self.stats["d2h_copies"] += 1
-                    self.stats["d2h_bytes"] += group.master.numel()
+                    self.stats["d2h_bytes"] += master.numel()
             self._restore_masters()
         except BaseException:
-            self._device_storages.clear()
-            self.loaded = False
+            # A failed synchronization must not drop storage still used by DMA
+            # or compute. A later close/offload may retry once the device recovers.
             self._release_cache(force=True)
             raise
         if not self.retain_device_storage:
             self._device_storages.clear()
+            self._active_transports = []
         self.loaded = False
         self._release_cache()
+
+    def close(self) -> None:
+        """Drain outstanding use before releasing explicit device allocations."""
+        self.offload()
+        current_omni_platform.synchronize()
+        self._device_storages.clear()
+        self._pending_storages.clear()
+        self._active_transports = []
+        self._reusable_transports.clear()
+        self._release_cache(force=True)
 
 
 __all__ = ["BoundedAllocatorCache", "PinnedModuleStager"]
