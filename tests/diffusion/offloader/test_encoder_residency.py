@@ -183,3 +183,36 @@ def test_partition_rejects_shared_storage_and_excess_residency():
         EncoderResidency(owner, torch.device("cpu"), EncoderResidencyOptions(resident_layers=2))
     with pytest.raises(ValueError, match="resident_layers"):
         EncoderResidency(model(), torch.device("cpu"), EncoderResidencyOptions(resident_layers=100))
+
+
+def test_pinning_without_frozen_master_copies_back_device_updates():
+    with patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor.clone()):
+        owner = model()
+        residency = EncoderResidency(owner, torch.device("cpu"), EncoderResidencyOptions(pinned_buffers=True))
+    residency.load()
+    owner.text_model.layers[0].weight.data.fill_(42)
+    residency.offload()
+    assert torch.all(owner.text_model.layers[0].weight == 42)
+
+
+def test_packed_transport_preserves_mixed_dtype_strided_aliases():
+    from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
+
+    owner = nn.Module()
+    base = torch.arange(24, dtype=torch.float32)
+    owner.left = nn.Parameter(base.as_strided((3, 3), (4, 1), 1))
+    owner.right = nn.Parameter(base.as_strided((3, 2), (4, 1), 3))
+    owner.register_buffer("integers", torch.arange(7, dtype=torch.int64))
+    owner.register_buffer("empty", torch.empty(0))
+    expected = {name: tensor.detach().clone() for name, tensor in (*owner.named_parameters(), *owner.named_buffers())}
+    layout = (owner.left.stride(), owner.left.storage_offset(), owner.right.storage_offset())
+    stager = PinnedModuleStager(owner, torch.device("cpu"), pin_memory=False, coalesce=True)
+    for _ in range(2):
+        stager.load()
+        assert owner.left.untyped_storage().data_ptr() == owner.right.untyped_storage().data_ptr()
+        assert layout == (owner.left.stride(), owner.left.storage_offset(), owner.right.storage_offset())
+        for name, tensor in (*owner.named_parameters(), *owner.named_buffers()):
+            assert torch.equal(tensor, expected[name])
+        stager.offload()
+    assert stager.stats["h2d_copies"] == 2
+    assert stager.stats["h2d_bytes"] == 2 * stager._transport_masters[0].numel()

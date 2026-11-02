@@ -26,6 +26,7 @@ class EncoderResidencyOptions:
     frozen_master: bool = False
     cache_retention: bool = False
     pinned_buffers: bool = False
+    packed_transport: bool = False
     resident_layers: int = 0
 
     def __post_init__(self) -> None:
@@ -40,6 +41,7 @@ class EncoderResidencyOptions:
             ("frozen_master", "FROZEN_MASTER"),
             ("cache_retention", "CACHE_RETENTION"),
             ("pinned_buffers", "PINNED_BUFFERS"),
+            ("packed_transport", "PACKED_TRANSPORT"),
         ):
             value = env.get("VLLM_OMNI_ENCODER_" + name, "0")
             if value not in ("0", "1"):
@@ -49,7 +51,13 @@ class EncoderResidencyOptions:
 
     @property
     def enabled(self) -> bool:
-        return self.frozen_master or self.cache_retention or self.pinned_buffers or self.resident_layers != 0
+        return (
+            self.frozen_master
+            or self.cache_retention
+            or self.pinned_buffers
+            or self.resident_layers != 0
+            or self.packed_transport
+        )
 
 
 class EncoderResidency:
@@ -70,7 +78,9 @@ class EncoderResidency:
             other = [module.vision, *[child for name, child in module.text_model.named_children() if name != "layers"]]
             partitions = [(layers[:count], True), ([*other, *layers[count:]], False)]
         self._validate_partition_aliases(partitions)
-        use_masters = options.frozen_master or options.pinned_buffers or options.resident_layers != 0
+        use_masters = (
+            options.frozen_master or options.pinned_buffers or options.resident_layers != 0 or options.packed_transport
+        )
         self.stagers = (
             [
                 PinnedModuleStager(
@@ -79,6 +89,8 @@ class EncoderResidency:
                     pin_memory=options.pinned_buffers,
                     cache_retention=self.cache,
                     retain_device_storage=resident,
+                    copy_back=not options.frozen_master,
+                    coalesce=options.packed_transport,
                 )
                 for members, resident in partitions
             ]

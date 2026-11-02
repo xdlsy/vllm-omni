@@ -12,7 +12,7 @@ import sys
 import types
 from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -43,6 +43,20 @@ def main():
     )
     import pytest
 
+    class CpuFixtures:
+        @pytest.fixture
+        def mocker(self):
+            patchers = []
+
+            def patch_object(*args, **kwargs):
+                patcher = patch.object(*args, **kwargs)
+                patchers.append(patcher)
+                return patcher.start()
+
+            yield types.SimpleNamespace(Mock=Mock, patch=types.SimpleNamespace(object=patch_object))
+            for patcher in reversed(patchers):
+                patcher.stop()
+
     return pytest.main(
         [
             "--noconftest",
@@ -50,8 +64,10 @@ def main():
             "addopts=",
             "-q",
             str(ROOT / "tests/diffusion/offloader/test_encoder_residency.py"),
+            str(ROOT / "tests/diffusion/offloader/test_module_residency.py"),
             *sys.argv[1:],
-        ]
+        ],
+        plugins=[CpuFixtures()],
     )
 
 

@@ -121,6 +121,8 @@ class PinnedModuleStager:
         copy_stream: Any | None = None,
         cache_retention: BoundedAllocatorCache | None = None,
         retain_device_storage: bool = False,
+        coalesce: bool = False,
+        copy_back: bool = False,
     ) -> None:
         modules = (module,) if isinstance(module, nn.Module) else tuple(module)
         if not modules or not all(isinstance(item, nn.Module) for item in modules):
@@ -132,7 +134,25 @@ class PinnedModuleStager:
         self.cache_retention = cache_retention
         self.retain_device_storage = retain_device_storage
         self.loaded = False
-        self._groups = self._snapshot_groups(modules, pin_memory=pin_memory)
+        self.copy_back = copy_back
+        self.stats = {"h2d_copies": 0, "h2d_bytes": 0, "d2h_copies": 0, "d2h_bytes": 0}
+        self._groups = self._snapshot_groups(modules, pin_memory=pin_memory and not coalesce)
+        self._transport_masters = [group.master for group in self._groups]
+        self._transport_layout = [(index, 0, group.master.numel()) for index, group in enumerate(self._groups)]
+        if coalesce and self._groups:
+            offsets = []
+            total = 0
+            for group in self._groups:
+                total = (total + 255) // 256 * 256
+                offsets.append(total)
+                total += group.master.numel()
+            packed = torch.zeros(total, dtype=torch.uint8, pin_memory=pin_memory)
+            for group, offset in zip(self._groups, offsets):
+                view = packed.narrow(0, offset, group.master.numel())
+                view.copy_(group.master)
+                group.master = view
+            self._transport_masters = [packed]
+            self._transport_layout = [(0, offset, group.master.numel()) for offset, group in zip(offsets, self._groups)]
         self._device_storages: list[torch.Tensor] = []
         self._restore_masters()
 
@@ -198,7 +218,7 @@ class PinnedModuleStager:
     @staticmethod
     def _view(backing: torch.Tensor, binding: _TensorBinding) -> torch.Tensor:
         return torch.empty(0, dtype=binding.dtype, device=backing.device).set_(
-            backing.untyped_storage(),
+            backing.untyped_storage()[backing.storage_offset() : backing.storage_offset() + backing.numel()],
             binding.storage_offset,
             binding.shape,
             binding.stride,
@@ -228,13 +248,18 @@ class PinnedModuleStager:
             self.cache_retention.release_if_needed(force=force)
 
     def _load_once(self) -> None:
-        device_storages = [torch.empty_like(group.master, device=self.device) for group in self._groups]
+        transports = [torch.empty_like(master, device=self.device) for master in self._transport_masters]
         compute_stream = current_omni_platform.current_stream()
         self.copy_stream.wait_stream(compute_stream)
         with current_omni_platform.stream(self.copy_stream):
-            for device_storage, group in zip(device_storages, self._groups):
-                device_storage.copy_(group.master, non_blocking=group.master.is_pinned())
+            for storage, master in zip(transports, self._transport_masters):
+                storage.copy_(master, non_blocking=master.is_pinned())
+                self.stats["h2d_copies"] += 1
+                self.stats["h2d_bytes"] += master.numel()
             self._ready_event.record(self.copy_stream)
+        device_storages = [
+            transports[index].narrow(0, offset, length) for index, offset, length in self._transport_layout
+        ]
 
         self._bind(device_storages)
         compute_stream.wait_event(self._ready_event)
@@ -283,6 +308,11 @@ class PinnedModuleStager:
         # the stage boundary, then discard device storage without any D2H copy.
         try:
             current_omni_platform.synchronize()
+            if self.copy_back:
+                for storage, group in zip(self._device_storages, self._groups):
+                    group.master.copy_(storage)
+                    self.stats["d2h_copies"] += 1
+                    self.stats["d2h_bytes"] += group.master.numel()
             self._restore_masters()
         except BaseException:
             self._device_storages.clear()
