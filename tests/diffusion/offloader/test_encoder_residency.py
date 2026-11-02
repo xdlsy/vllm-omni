@@ -216,3 +216,37 @@ def test_packed_transport_preserves_mixed_dtype_strided_aliases():
         stager.offload()
     assert stager.stats["h2d_copies"] == 2
     assert stager.stats["h2d_bytes"] == 2 * stager._transport_masters[0].numel()
+
+
+@pytest.mark.parametrize("group_size", [1, 2, 4])
+def test_grouped_layer_hooks_match_reference_and_unload(group_size):
+    owner = model()
+    value = torch.randn(2, 3)
+    expected = value
+    for layer in owner.text_model.layers:
+        expected = layer(expected)
+    residency = EncoderResidency(owner, torch.device("cpu"), EncoderResidencyOptions(group_size=group_size))
+    residency.load()
+    output = value
+    for index, layer in enumerate(owner.text_model.layers):
+        output = layer(output)
+        if (index + 1) % group_size == 0:
+            assert not residency.stagers[residency.block_groups[index // group_size][1]].loaded
+    assert torch.equal(output, expected)
+    residency.offload()
+    assert not any(stager.loaded for stager in residency.stagers)
+    residency.close()
+    assert not any(layer._forward_pre_hooks or layer._forward_hooks for layer in owner.text_model.layers)
+
+
+def test_group_exception_cleanup_allows_next_request():
+    owner = model()
+    residency = EncoderResidency(owner, torch.device("cpu"), EncoderResidencyOptions(group_size=2))
+    residency.load()
+    owner.text_model.layers[0](torch.ones(1, 3))
+    residency.offload()  # exception before group's last layer
+    assert not any(stager.loaded for stager in residency.stagers)
+    residency.load()
+    for layer in owner.text_model.layers:
+        layer(torch.ones(1, 3))
+    residency.offload()

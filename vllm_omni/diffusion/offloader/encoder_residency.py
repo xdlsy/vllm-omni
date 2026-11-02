@@ -28,8 +28,13 @@ class EncoderResidencyOptions:
     pinned_buffers: bool = False
     packed_transport: bool = False
     resident_layers: int = 0
+    group_size: int = 0
 
     def __post_init__(self) -> None:
+        if self.group_size < 0:
+            raise ValueError("group_size must be 0 (model), 1 (layer), or a positive block count")
+        if self.group_size and self.resident_layers == -1:
+            raise ValueError("Model residency and grouped unloading cannot be combined")
         if self.resident_layers < -1:
             raise ValueError("resident_layers must be -1 (all), 0 (off), or a positive layer count")
 
@@ -47,7 +52,11 @@ class EncoderResidencyOptions:
             if value not in ("0", "1"):
                 raise ValueError("VLLM_OMNI_ENCODER_" + name + " must be 0 or 1")
             values[field] = value == "1"
-        return cls(**values, resident_layers=int(env.get("VLLM_OMNI_ENCODER_RESIDENT_LAYERS", "0")))
+        return cls(
+            **values,
+            resident_layers=int(env.get("VLLM_OMNI_ENCODER_RESIDENT_LAYERS", "0")),
+            group_size=int(env.get("VLLM_OMNI_ENCODER_GROUP_SIZE", "0")),
+        )
 
     @property
     def enabled(self) -> bool:
@@ -57,6 +66,7 @@ class EncoderResidencyOptions:
             or self.pinned_buffers
             or self.resident_layers != 0
             or self.packed_transport
+            or self.group_size != 0
         )
 
 
@@ -77,9 +87,31 @@ class EncoderResidency:
             count = options.resident_layers
             other = [module.vision, *[child for name, child in module.text_model.named_children() if name != "layers"]]
             partitions = [(layers[:count], True), ([*other, *layers[count:]], False)]
+        self.block_groups: list[tuple[list[nn.Module], int]] = []
+        if options.group_size:
+            text_layers = list(module.text_model.layers)
+            count = options.resident_layers
+            vision_layers = list(getattr(module.vision, "blocks", ()))
+            nonblocks = [child for name, child in module.text_model.named_children() if name != "layers"]
+            if vision_layers:
+                nonblocks.extend(child for name, child in module.vision.named_children() if name != "blocks")
+            else:
+                nonblocks.append(module.vision)
+            partitions = [(nonblocks, False)]
+            if count:
+                partitions.append((text_layers[:count], True))
+            for stack in (vision_layers, text_layers[count:]):
+                for start in range(0, len(stack), options.group_size):
+                    members = stack[start : start + options.group_size]
+                    self.block_groups.append((members, len(partitions)))
+                    partitions.append((members, False))
         self._validate_partition_aliases(partitions)
         use_masters = (
-            options.frozen_master or options.pinned_buffers or options.resident_layers != 0 or options.packed_transport
+            options.frozen_master
+            or options.pinned_buffers
+            or options.resident_layers != 0
+            or options.packed_transport
+            or options.group_size != 0
         )
         self.stagers = (
             [
@@ -97,6 +129,33 @@ class EncoderResidency:
             if use_masters
             else []
         )
+        self._active = False
+        self._handles = []
+        for members, index in self.block_groups:
+            self._handles.append(members[0].register_forward_pre_hook(self._before_group(index)))
+            self._handles.append(members[-1].register_forward_hook(self._after_group(index), always_call=True))
+
+    def _before_group(self, index: int):
+        def before(_module, _args):
+            if not self._active:
+                raise RuntimeError("Call encoder.load_to_device before grouped encoder execution")
+            self.stagers[index].load()
+
+        return before
+
+    def _after_group(self, index: int):
+        def after(_module, _args, _output):
+            self.stagers[index].offload()
+
+        return after
+
+    def close(self) -> None:
+        try:
+            self.offload()
+        finally:
+            for handle in self._handles:
+                handle.remove()
+            self._handles.clear()
 
     @staticmethod
     def _validate_partition_aliases(partitions: list[tuple[list[nn.Module], bool]]) -> None:
@@ -120,15 +179,19 @@ class EncoderResidency:
     def load(self) -> None:
         if not self.stagers:
             self.module.to(self.device)
+        self._active = True
+        block_indices = {index for _, index in self.block_groups}
         try:
-            for stager in self.stagers:
-                stager.load()
+            for index, stager in enumerate(self.stagers):
+                if index not in block_indices:
+                    stager.load()
         except BaseException:
             self.offload()
             raise
         self.stats["loads"] += 1
 
     def offload(self) -> None:
+        self._active = False
         if not self.stagers:
             self.module.to("cpu")
             if self.cache is not None:
