@@ -48,6 +48,7 @@ from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
 )
+from vllm_omni.diffusion.profiler.stage_timer import timed_stage
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
@@ -1283,43 +1284,46 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
     def load_to_device(self) -> None:
         if not self.is_loaded:
             return
-        if getattr(self, "_omni_layerwise_enabled", False):
-            stager = getattr(self, "_omni_non_block_stager", None)
-            if stager is None:
-                hooks = getattr(self, "_omni_layerwise_hooks", ())
-                pin_memory = bool(getattr(hooks[0], "pin_memory", True)) if hooks else True
-                stager = PinnedModuleStager(
-                    self._omni_non_block_modules(),
-                    self.device_target,
-                    pin_memory=pin_memory,
-                    cache_retention=getattr(self, "_omni_component_cache", None),
-                )
-                self._omni_non_block_stager = stager
-            stager.load()
-            return
-        self.vision.to(self.device_target)
-        self.text_model.to(self.device_target)
+        with timed_stage("load", component=self):
+            if getattr(self, "_omni_layerwise_enabled", False):
+                stager = getattr(self, "_omni_non_block_stager", None)
+                if stager is None:
+                    hooks = getattr(self, "_omni_layerwise_hooks", ())
+                    pin_memory = bool(getattr(hooks[0], "pin_memory", True)) if hooks else True
+                    stager = PinnedModuleStager(
+                        self._omni_non_block_modules(),
+                        self.device_target,
+                        pin_memory=pin_memory,
+                        cache_retention=getattr(self, "_omni_component_cache", None),
+                    )
+                    self._omni_non_block_stager = stager
+                stager.load()
+                return
+            self.vision.to(self.device_target)
+            self.text_model.to(self.device_target)
 
     def offload_to_cpu(self) -> None:
         if not self.is_loaded:
             return
-        if getattr(self, "_omni_layerwise_enabled", False):
-            for hook in self._omni_layerwise_hooks:
-                hook.offload_layer()
-            stager = getattr(self, "_omni_non_block_stager", None)
-            if stager is not None:
-                stager.offload()
-            else:
-                # The initial DLO setup reaches this branch before the first
-                # load. These modules were constructed on CPU, so this is not
-                # a device-to-host rematerialization.
-                for child in self._omni_non_block_modules():
-                    child.to("cpu")
-                self._release_omni_component_cache()
-            return
-        self.vision.to("cpu")
-        self.text_model.to("cpu")
-        torch.accelerator.empty_cache()
+        with timed_stage("offload", component=self):
+            if getattr(self, "_omni_layerwise_enabled", False):
+                for hook in self._omni_layerwise_hooks:
+                    hook.offload_layer()
+                stager = getattr(self, "_omni_non_block_stager", None)
+                if stager is not None:
+                    stager.offload()
+                else:
+                    # The initial DLO setup reaches this branch before the first
+                    # load. These modules were constructed on CPU, so this is not
+                    # a device-to-host rematerialization.
+                    for child in self._omni_non_block_modules():
+                        child.to("cpu")
+                    self._release_omni_component_cache()
+                return
+            self.vision.to("cpu")
+            self.text_model.to("cpu")
+            with timed_stage("release", component=self):
+                torch.accelerator.empty_cache()
 
     def _omni_non_block_modules(self) -> list[nn.Module]:
         modules = [child for name, child in self.vision.named_children() if name != "blocks"]
@@ -1333,11 +1337,12 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             stager.set_cache_retention(cache)
 
     def _release_omni_component_cache(self) -> None:
-        cache = getattr(self, "_omni_component_cache", None)
-        if cache is None:
-            torch.accelerator.empty_cache()
-        else:
-            cache.release_if_needed()
+        with timed_stage("release", component=self):
+            cache = getattr(self, "_omni_component_cache", None)
+            if cache is None:
+                torch.accelerator.empty_cache()
+            else:
+                cache.release_if_needed()
 
     def _encode(
         self,
@@ -1482,14 +1487,16 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         cudnn_sdp_enabled = torch.backends.cuda.cudnn_sdp_enabled()
         torch.backends.cuda.enable_cudnn_sdp(True)
         try:
-            hidden = self._encode(
-                input_ids,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                pixel_values_videos=pixel_values_videos,
-                video_grid_thw=video_grid_thw,
-            )
-            return hidden.cpu()
+            with timed_stage("encoder_forward"):
+                hidden = self._encode(
+                    input_ids,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    pixel_values_videos=pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
+                )
+            with timed_stage("result_to_cpu"):
+                return hidden.cpu()
         finally:
             torch.backends.cuda.enable_cudnn_sdp(cudnn_sdp_enabled)
 

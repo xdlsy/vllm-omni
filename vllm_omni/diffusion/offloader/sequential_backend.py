@@ -10,6 +10,7 @@ from torch.distributed._tensor import DTensor  # type: ignore[attr-defined]
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
+from vllm_omni.diffusion.profiler.stage_timer import timed_stage
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, SupportsModelCpuOffload
@@ -131,29 +132,32 @@ class SequentialOffloadHook(ModelHook):
         return hook._stager if isinstance(hook, SequentialOffloadHook) else None
 
     def _to_cpu(self, module: nn.Module) -> None:
-        stager = self._module_stager(module)
-        if stager is not None:
-            stager.offload()
-            return
-        # XPU's allocator doesn't respect stream dependencies in empty_cache,
-        # so non-blocking copies can race with cache eviction. Use blocking
-        # copies on XPU to avoid NULL pointer errors during DMA.
-        non_blocking = not self.use_hsdp and not current_omni_platform.is_xpu()
-        moved = self._move_params(
-            module,
-            torch.device("cpu"),
-            non_blocking=non_blocking,
-            pin_memory=self.pin_memory,
-        )
-        if moved:
-            current_omni_platform.empty_cache()
+        with timed_stage("offload", component=module):
+            stager = self._module_stager(module)
+            if stager is not None:
+                stager.offload()
+                return
+            # XPU's allocator doesn't respect stream dependencies in empty_cache,
+            # so non-blocking copies can race with cache eviction. Use blocking
+            # copies on XPU to avoid NULL pointer errors during DMA.
+            non_blocking = not self.use_hsdp and not current_omni_platform.is_xpu()
+            moved = self._move_params(
+                module,
+                torch.device("cpu"),
+                non_blocking=non_blocking,
+                pin_memory=self.pin_memory,
+            )
+            if moved:
+                with timed_stage("release", component=module):
+                    current_omni_platform.empty_cache()
 
     def _to_gpu(self, module: nn.Module) -> None:
-        stager = self._module_stager(module)
-        if stager is not None:
-            stager.load()
-            return
-        self._move_params(module, self.device, non_blocking=False)
+        with timed_stage("load", component=module):
+            stager = self._module_stager(module)
+            if stager is not None:
+                stager.load()
+                return
+            self._move_params(module, self.device, non_blocking=False)
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
         # Offload target modules to CPU

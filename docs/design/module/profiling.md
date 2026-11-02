@@ -32,6 +32,17 @@ validation to the engine configuration. See the
 [offline profiling guide](../../contributing/profiling.md#offline-qwen25-omni-and-cosyvoice3-examples)
 for commands and the shared helper API.
 
+MiniMax-H3 uses the existing pipeline-profiler switch for non-synchronizing,
+rank-local `encode_prompt` sub-stage accounting. The timer scope is reset on
+success and failure; component timing filters out unrelated module swaps.
+Instrumentation observes the existing offload lifecycle, including deferred
+sequential offload, and adds no cross-rank collectives or device synchronization.
+The existing outer profiler and model-required synchronization remain unchanged.
+Measurements describe host wall time (including asynchronous submission), with
+clock/accounting/logging overhead rather than a guarantee of zero overhead. See
+[the stage-timing guide](../../contributing/profiling.md#minimax-h3-prompt-encoding-stage-timing)
+for boundaries, missing-stage semantics, and synchronization overhead.
+
 ## Candidate invariants
 
 ### PROFILE-INV-001: Profiling is opt-in

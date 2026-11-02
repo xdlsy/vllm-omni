@@ -2,6 +2,134 @@
 
 > **Warning:** Profiling is for development and debugging only. It adds significant overhead and should not be enabled in production.
 
+## MiniMax-H3 prompt-encoding stage timing
+
+For MiniMax-H3 NPU tuning, add `--enable-diffusion-pipeline-profiler` to your
+existing working server command, or set `enable_diffusion_pipeline_profiler=True`
+in its diffusion configuration. This reuses the existing pipeline-profiler switch;
+it does not require `profiler_config` or kernel trace collection.
+
+Each local `encode_prompt` call emits one `[MiniMaxH3EncodePromptProfiler]` JSON
+log containing `rank`, `status` (`ok` or `failed`), `timing_mode=host_wall`,
+and the stages that actually ran (in seconds):
+
+| Field | Measured boundary |
+| --- | --- |
+| `input_prepare_and_distribute` | Rank-0 image/video processing, token presentation, error propagation, and input distribution to Encoder TP ranks. |
+| `encoder_load` | Encoder weight loading, through either the component lifecycle or the sequential offload hook. |
+| `encoder_forward` | Qwen3-VL `_encode`, including input device copies and any layerwise weight staging performed inside forward. |
+| `result_to_cpu` | `hidden.cpu()`, including any dependency waiting inherent in that copy. |
+| `encoder_offload` | Encoder weight offloading performed inside this call, excluding separately timed cache release. |
+| `device_memory_release` | Explicit Encoder cache-release calls; it does not include every allocator operation inside layerwise stagers. |
+| `result_distribute` | Final hidden-state and token-tag broadcasts to DiT ranks, including waiting for the source rank. |
+
+The same sub-stage durations accumulate under
+`MiniMaxH3Pipeline.encode_prompt.<field>` in the existing per-request
+`stage_durations`. The existing `MiniMaxH3Pipeline.encode_prompt` total remains
+available. Its original outer wrapper still synchronizes before and after the
+call. It includes the final device-completion wait and publishing the JSON
+summary. No additional total-duration metric is introduced.
+
+The new stages measure host wall-clock time in seconds and **add no device
+synchronization**. Existing code is unchanged: the outer pipeline profiler still
+synchronizes at its original function boundaries, and model-required
+synchronization, blocking copies, and dependency waits remain in place.
+No cross-rank barrier or reduction is added. Thus enabling the existing profiler
+still has its original synchronization cost; these sub-stage timers add none.
+
+Timing is off by default. When off, the new scopes do not read the clock or emit
+summaries. When on, reading the clock, accumulating durations, and publishing
+one summary per call still have overhead; this is not a zero-overhead guarantee.
+Nested stages use exclusive accounting, so an explicitly timed cache release is
+not counted again in `encoder_offload`.
+
+Asynchronous operations can return before device execution finishes. In that
+case `encoder_forward` measures host submission rather than complete NPU compute
+time, and an existing blocking `result_to_cpu` can include waiting for forward.
+These values describe the running host path and must not be interpreted as
+isolated device-kernel durations. Use a separate kernel trace when that
+distinction is needed.
+
+Interpret the measurements using the actual offload configuration:
+
+- Non-Encoder ranks report preparation and result distribution only; their
+  result-distribution interval can include waiting for the entire Encoder run.
+- Missing fields mean the stage was not entered, rather than a measured zero.
+  A resident Encoder has no offload/release fields. Sequential model offload can
+  defer Encoder eviction until a later stage; timing does not move it into
+  `encode_prompt`. A load call on already resident weights may be very short.
+- Layerwise transfers and internal stager cleanup remain charged to the enclosing
+  forward/load/offload interval. `device_memory_release` covers only the explicit
+  release scopes in the table.
+- Other-component eviction (for example swapping out the DiT before Encoder
+  loading), dispatch, and instrumentation overhead can make the total larger
+  than the sum of the seven fields. Sub-stage values and the parent total must
+  not be added together. Do not sum times across ranks.
+- Failed calls report partial timing with `status=failed`; exclude those samples
+  from successful-request timing. Each JSON summary belongs to one call, while
+  `stage_durations` accumulates calls until the existing request-record reset.
+
+Use these measurements to locate host-visible costs without adding synchronization
+between the existing boundaries. Confirm the instrumentation's latency impact with profiling enabled
+and disabled on the target NPU under the same workload. Recollect a baseline
+with the same timing mode before comparing historical numbers; synchronized and
+unsynchronized stage values have different attribution. CPU tests cannot
+establish NPU output equivalence or negligible performance impact.
+
+### Comparing an optimization with A/B/A
+
+Use two separate measurement passes. The primary pass compares complete request
+latency with pipeline profiling and kernel tracing disabled. The diagnostic pass
+uses the pipeline-profiler switch identically in all arms and compares the
+existing synchronized `MiniMaxH3Pipeline.encode_prompt` total. The JSON summary's seven sub-stages explain host-path changes; they are not the
+acceptance metric for device work. Do not compare the two timing
+modes or add parent and child durations together.
+
+Reuse the existing [diffusion serving benchmark](../../benchmarks/diffusion/README.md).
+Its `--output-file` JSON contains `latency_mean`, `completed_requests`,
+`failed_requests`, and `stage_durations_mean`. For `/v1/videos`, its request
+latency includes job submission, completion polling, content retrieval, and
+job-cleanup time. Keep the same endpoint and client behavior across arms; polling
+can obscure small changes. This is a client-visible metric, not device execution
+time. In the diagnostic pass, use server logs if a deployment does not return
+stage metrics in its response; do not treat an empty stage dictionary as zero.
+
+1. Record the baseline and optimized revisions, exact launch commands, card group,
+   weights, offload policy, and environment. Keep prompt/media, seed, resolution,
+   frames, steps, concurrency, and request sequence identical. The optimization
+   under test should be the only intentional difference.
+2. Run baseline-before, optimized, then baseline-after serially in the same
+   measurement window. Stop only the service processes you started between arms;
+   check that the next launch actually uses the intended configuration.
+3. After each restart, prewarm with at least five **full-workload** requests
+   (at least ten with compilation), separately from the measured requests.
+   The benchmark's built-in video warmup uses one frame and reduced steps;
+   it is not a substitute for warming the actual video shape.
+4. Use the same working benchmark command for every arm. A full-workload prewarm
+   batch can be run with `--warmup-requests 0 --num-prompts 5`; discard that batch
+   from the measurements. Then run the same command with
+   `--warmup-requests 0 --num-prompts 5 --output-file <arm>.json`. These flags
+   assume all workload arguments already match your actual request. Preserve your
+   original concurrency; use `--max-concurrency 1` when evaluating serial latency.
+5. Require all measured requests to complete successfully and return nonempty
+   artifacts. Retain response status/bytes, request-to-log correlation, raw timing
+   samples, and output hashes separately: the benchmark's aggregate metrics JSON
+   alone does not preserve all of that evidence. For an intended lossless change,
+   verify output/tensor equivalence and artifact health before accepting latency.
+6. Report all three arm means. With equal sample counts, use
+   `control = (baseline_before + baseline_after) / 2`,
+   `saved_seconds = control - optimized`, and
+   `reduction_percent = 100 * saved_seconds / control`.
+   Also report baseline drift and sample variation. If the gain is comparable to
+   that variation, collect more same-window samples rather than declare a speedup.
+
+An `encode_prompt` improvement alone is insufficient: offload or waiting may
+have moved to the next stage. Accept a latency improvement only when the complete
+request benefits as well. The synchronized diagnostic pass and the unprofiled
+primary pass must each have their own baseline; historical numbers are context,
+not the denominator for a new result. Until the target-NPU runs and correctness
+checks are complete, label any provisional numbers as exploratory.
+
 ## Offline Qwen2.5-Omni and CosyVoice3 examples
 
 Both examples accept `--profiler-config` as a JSON object and forward the parsed

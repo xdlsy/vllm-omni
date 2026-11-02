@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
@@ -65,6 +65,7 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
+from vllm_omni.diffusion.profiler.stage_timer import StageTimer, timed_stage
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.diffusion.utils.media_utils import normalize_preencode_batch_frames, normalize_video_codec_options
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -2796,51 +2797,93 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(str(exc)) from exc
         return videos
 
+    @contextmanager
+    def _profile_encode_prompt(self, rank: int) -> Iterator[None]:
+        """Report rank-local sub-stages only while the existing profiler is on."""
+        if not getattr(self, "enable_diffusion_pipeline_profiler", False):
+            yield
+            return
+
+        timer = StageTimer(
+            component=self.text_encoder,
+            component_stages={
+                "load": "encoder_load",
+                "offload": "encoder_offload",
+                "release": "device_memory_release",
+            },
+        )
+        status = "failed"
+        try:
+            with timer.activate():
+                yield
+            status = "ok"
+        finally:
+            prefix = f"{type(self).__name__}.encode_prompt"
+            with self._profiler_lock:
+                for stage, duration in timer.durations.items():
+                    key = f"{prefix}.{stage}"
+                    self._stage_durations[key] = self._stage_durations.get(key, 0.0) + duration
+            logger.info(
+                "[MiniMaxH3EncodePromptProfiler] %s",
+                json.dumps(
+                    {
+                        "rank": rank,
+                        "status": status,
+                        "timing_mode": "host_wall",
+                        **timer.durations,
+                    }
+                ),
+            )
+
     def encode_prompt(self, prepared: PreparedEncoderInputs | None) -> tuple[torch.Tensor, torch.Tensor]:
         _, rank, _ = _dit_rank_world()
-        ids = tags = hidden = None
-        vision_kwargs: dict[str, torch.Tensor] = {}
-        error = None
-        if rank == 0:
-            try:
-                if prepared is None:
-                    raise ValueError("rank 0 must prepare MiniMax H3 text inputs")
-                if prepared.images:
-                    vision = self.processor.image_processor(images=prepared.images, return_tensors="pt")
-                    vision_kwargs.update(
-                        pixel_values=vision["pixel_values"],
-                        image_grid_thw=vision["image_grid_thw"],
-                    )
-                if prepared.qwen_videos:
-                    vision = self.processor.video_processor(
-                        videos=[frames for frames, _ in prepared.qwen_videos],
-                        do_sample_frames=False,
-                        return_tensors="pt",
-                    )
-                    vision_kwargs.update(
-                        pixel_values_videos=vision["pixel_values_videos"],
-                        video_grid_thw=vision["video_grid_thw"],
-                    )
-                ids, tags = build_minimax_h3_presentation(
-                    self.tokenizer,
-                    prompt=prepared.prompt,
-                    task=prepared.media.task,
-                    condition_labels=prepared.condition_labels,
-                    image_grid_thw=vision_kwargs.get("image_grid_thw"),
-                    video_grid_thw=vision_kwargs.get("video_grid_thw"),
-                    video_timestamps=prepared.video_timestamps,
-                    merge_size=int(self.processor.image_processor.merge_size),
+        with self._profile_encode_prompt(rank):
+            with timed_stage("input_prepare_and_distribute"):
+                ids = tags = hidden = None
+                vision_kwargs: dict[str, torch.Tensor] = {}
+                error = None
+                if rank == 0:
+                    try:
+                        if prepared is None:
+                            raise ValueError("rank 0 must prepare MiniMax H3 text inputs")
+                        if prepared.images:
+                            vision = self.processor.image_processor(images=prepared.images, return_tensors="pt")
+                            vision_kwargs.update(
+                                pixel_values=vision["pixel_values"],
+                                image_grid_thw=vision["image_grid_thw"],
+                            )
+                        if prepared.qwen_videos:
+                            vision = self.processor.video_processor(
+                                videos=[frames for frames, _ in prepared.qwen_videos],
+                                do_sample_frames=False,
+                                return_tensors="pt",
+                            )
+                            vision_kwargs.update(
+                                pixel_values_videos=vision["pixel_values_videos"],
+                                video_grid_thw=vision["video_grid_thw"],
+                            )
+                        ids, tags = build_minimax_h3_presentation(
+                            self.tokenizer,
+                            prompt=prepared.prompt,
+                            task=prepared.media.task,
+                            condition_labels=prepared.condition_labels,
+                            image_grid_thw=vision_kwargs.get("image_grid_thw"),
+                            video_grid_thw=vision_kwargs.get("video_grid_thw"),
+                            video_timestamps=prepared.video_timestamps,
+                            merge_size=int(self.processor.image_processor.merge_size),
+                        )
+                    except Exception as exc:
+                        error = exc
+                _broadcast_rank0_exception(error)
+                if rank < self.text_encoder_tp_size:
+                    ids = self._distribute_encode_inputs(ids, vision_kwargs)
+            if rank < self.text_encoder_tp_size:
+                hidden = self._encode_text_hidden(ids, vision_kwargs)
+            with timed_stage("result_distribute"):
+                return (
+                    _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device),
+                    _broadcast_tensor(tags, dtype=torch.long, device=self.device),
                 )
-            except Exception as exc:
-                error = exc
-        _broadcast_rank0_exception(error)
-        if rank < self.text_encoder_tp_size:
-            ids = self._distribute_encode_inputs(ids, vision_kwargs)
-            hidden = self._encode_text_hidden(ids, vision_kwargs)
-        return (
-            _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device),
-            _broadcast_tensor(tags, dtype=torch.long, device=self.device),
-        )
 
     def _distribute_media_inputs(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaInput:
         group, rank, world_size = _dit_rank_world()
