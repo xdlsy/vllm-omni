@@ -140,3 +140,23 @@ def test_cache_retention_is_independent_and_obeys_bounds():
         residency.load()
         residency.offload()
         release.assert_called_once()
+
+
+def test_pinned_masters_are_allocated_once_and_reused():
+    calls = []
+
+    def pin(tensor):
+        calls.append(tensor.numel())
+        return tensor.clone()
+
+    options = EncoderResidencyOptions.from_env({"VLLM_OMNI_ENCODER_PINNED_BUFFERS": "1"})
+    with patch.object(torch.Tensor, "pin_memory", pin):
+        residency = EncoderResidency(model(), torch.device("cpu"), options)
+        assert calls
+        initial_calls = len(calls)
+        masters = [group.master.data_ptr() for group in residency.stagers[0]._groups]
+        for _ in range(3):
+            residency.load()
+            residency.offload()
+        assert len(calls) == initial_calls
+        assert masters == [group.master.data_ptr() for group in residency.stagers[0]._groups]

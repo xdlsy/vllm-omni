@@ -25,12 +25,17 @@ from .module_residency import BoundedAllocatorCache, PinnedModuleStager
 class EncoderResidencyOptions:
     frozen_master: bool = False
     cache_retention: bool = False
+    pinned_buffers: bool = False
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> EncoderResidencyOptions:
         env = os.environ if environ is None else environ
         values = {}
-        for field, name in (("frozen_master", "FROZEN_MASTER"), ("cache_retention", "CACHE_RETENTION")):
+        for field, name in (
+            ("frozen_master", "FROZEN_MASTER"),
+            ("cache_retention", "CACHE_RETENTION"),
+            ("pinned_buffers", "PINNED_BUFFERS"),
+        ):
             value = env.get("VLLM_OMNI_ENCODER_" + name, "0")
             if value not in ("0", "1"):
                 raise ValueError("VLLM_OMNI_ENCODER_" + name + " must be 0 or 1")
@@ -39,7 +44,7 @@ class EncoderResidencyOptions:
 
     @property
     def enabled(self) -> bool:
-        return self.frozen_master or self.cache_retention
+        return self.frozen_master or self.cache_retention or self.pinned_buffers
 
 
 class EncoderResidency:
@@ -52,8 +57,8 @@ class EncoderResidency:
         self.cache = BoundedAllocatorCache(device) if options.cache_retention else None
         self.stats = {"loads": 0, "offloads": 0}
         self.stagers = (
-            [PinnedModuleStager(module, device, pin_memory=False, cache_retention=self.cache)]
-            if options.frozen_master
+            [PinnedModuleStager(module, device, pin_memory=options.pinned_buffers, cache_retention=self.cache)]
+            if options.frozen_master or options.pinned_buffers
             else []
         )
 
